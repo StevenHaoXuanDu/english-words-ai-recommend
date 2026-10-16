@@ -7,6 +7,7 @@ import math
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from scipy.optimize import linear_sum_assignment
 
 W, H = 1920, 1080
 Y0 = 500.0                      # row centreline
@@ -18,6 +19,10 @@ ROW_R = 1760.0 + RECT_W / 2 + 8
 
 GLOW_SIGMA_IN, GLOW_GAIN_IN = 6.0, 0.55     # "blur 12 px, 35 %" from the script, lifted
 GLOW_SIGMA_OUT, GLOW_GAIN_OUT = 26.0, 0.24  # wide faint bloom
+GLOW_KNEE, GLOW_CEIL = 0.45, 0.80           # soft knee on the summed glow (brightest channel):
+                                            # one rect, a row or a block stays below the knee
+                                            # (glow <= 0.49); dense mid-tween piles roll off
+                                            # toward 0.80, hue kept, so they stay gold, not white
 
 
 def X(x):
@@ -84,13 +89,122 @@ LIN_TO_SRGB = np.clip(np.rint(_to_srgb(np.linspace(0.0, 1.0, _LIN_N)) * 255.0), 
 
 
 # ----------------------------------------------------------------------------- layout
-class Layout:
-    """Screen layout of one opinion vector: groups stack into centred column-major grids."""
+ATTACH_DX = (6.0, 12.0)   # straggler parked at a block's free slot: outward offset range (px)
+ATTACH_LIFT = 5.0         # ... and lift above that slot (px), so it reads as not yet inside
+TIE = 1e-4                # px^2 per (rank - slot)^2: breaks exact ties in slot assignment
+SWITCH = (6 * ROW_PITCH) ** 2   # px^2 per change of target column along one source column
+COHERE_MAX = 30000              # skip the re-deal when a source column has more labelings than this
 
-    def __init__(self, op):
+
+def _labelings(counts):
+    """Every sequence over len(counts) labels that uses label c exactly counts[c] times."""
+    n = sum(counts)
+    seq = [0] * n
+    left = list(counts)
+
+    def rec(i):
+        if i == n:
+            yield tuple(seq)
+            return
+        for c in range(len(left)):
+            if left[c]:
+                left[c] -= 1
+                seq[i] = c
+                yield from rec(i + 1)
+                left[c] += 1
+    return rec(0)
+
+
+def _cohere(pick, S, px, py):
+    """Keep each source column together. A source column is the members of a group drawn at
+    the same x just before (a single-column stack, or one column of a block). When the
+    assignment splits one over several block columns, the split is dealt out row by row in
+    alternation (a 10-stack straddling two columns: left, right, left, ...), which during the
+    x-first half of a round tween shows as a zig-zag 'zipper'. Here the rects of the source
+    column are re-dealt among those same target columns, as many to each as before (so the
+    horizontal movement is unchanged), choosing the deal with the fewest changes of target
+    column walking the source column top to bottom, SWITCH px^2 each, on top of the squared
+    vertical moves. Inside every target column touched, rows go to its rects in the order of
+    their previous height, so nothing passes through anything while stacking."""
+    pick = np.array(pick)
+    k = len(pick)
+    tx = np.round(S[:, 0], 3)
+    done = np.zeros(k, bool)
+    for i in range(k):
+        if done[i]:
+            continue
+        src = np.flatnonzero(np.abs(px - px[i]) < 0.5)
+        done[src] = True
+        if len(src) < 2:
+            continue
+        cols = np.unique(tx[pick[src]])
+        if len(cols) < 2:
+            continue
+        mem = src[np.argsort(py[src], kind="stable")]                    # top to bottom
+        counts = [int((tx[pick[mem]] == c).sum()) for c in cols]
+        if math.factorial(len(mem)) // math.prod(math.factorial(c) for c in counts) > COHERE_MAX:
+            continue
+        cur_ty = S[pick, 1]
+        insrc = np.zeros(k, bool)
+        insrc[mem] = True
+        others = [np.flatnonzero((tx[pick] == c) & ~insrc) for c in cols]
+        slots = [np.flatnonzero(tx == c)[np.argsort(S[tx == c, 1], kind="stable")] for c in cols]
+        best = None
+        for lab in _labelings(counts):
+            lab = np.array(lab)
+            cost = SWITCH * int((lab[1:] != lab[:-1]).sum())
+            deal = []
+            for ci in range(len(cols)):
+                m = np.concatenate([others[ci], mem[lab == ci]])
+                m = m[np.lexsort((cur_ty[m], py[m]))]
+                cost += float(((S[slots[ci], 1] - py[m]) ** 2).sum())
+                deal.append(m)
+            if best is None or cost < best[0] - 1e-6:
+                best = (cost, deal)
+        for ci, m in enumerate(best[1]):
+            pick[m] = slots[ci]
+    return pick
+
+
+def _slot_xy(j, k, xm, inward):
+    """Design-px centre of grid slot j of a k-member block centred on xm. Slots fill column-major,
+    bottom row first, starting from the block's outer column (inward=+1: left column first, the
+    partial column ends up on the right; -1 mirrored), so a block's free slots face the middle
+    of the row, where newcomers arrive from. j >= k gives the block's next free slots."""
+    rows, cols = min(10, k), math.ceil(k / 10)
+    c, r = divmod(j, 10)
+    ci = c if inward > 0 else cols - 1 - c
+    return xm + (ci - (cols - 1) / 2) * COL_PITCH, Y0 + ((rows - 1) / 2 - r) * ROW_PITCH
+
+
+class Layout:
+    """Screen layout of one opinion vector: groups stack into centred column-major grids.
+
+    prev (a Layout) or prev_pos ((wx, wy) arrays) is where the rects are drawn just before this
+    state. Each group's grid slots then go to its members by minimum total squared movement
+    (Hungarian assignment), so members already in a block keep their slots from round to round
+    and a newcomer takes the free slot nearest to it; _cohere then keeps each source column
+    (a stack, or a block column) in as few straight runs as possible when it lands in several
+    block columns. Build a round sequence with layout_seq().
+
+    Two drawing rules keep overlaps honest and legible (opinions themselves are untouched):
+    * a single rect whose opinion falls inside a multi-column block's footprint is parked at the
+      block's next free slot, offset outward toward its true side and lifted a few px: visibly
+      separate from the block until it really joins;
+    * a run of overlapping single-column stacks with mixed odd/even heights is drawn on one shared
+      row grid (the parity with fewer votes shifts up half a row; single rects touching the run
+      vote odd, as they sit on the row line), instead of a brick-bond of staggered rows with
+      pinholes. Horizontal positions are not changed, so no spread is misrepresented. Runs that
+      lean on a multi-column block are left alone (aligning them could hide rects exactly
+      behind a block column).
+    """
+
+    def __init__(self, op, prev=None, prev_pos=None):
         op = np.asarray(op, dtype=np.float64)
         self.op = op
         n = len(op)
+        if prev is not None:
+            prev_pos = (prev.wx, prev.wy)
         order = np.argsort(op, kind="stable")
         groups, cur = [], [order[0]]
         for a, b in zip(order[:-1], order[1:]):
@@ -103,19 +217,98 @@ class Layout:
         self.wx = np.empty(n)
         self.wy = np.empty(n)
         self.gsize = np.empty(n, dtype=int)   # size of the group each agent stacks in
-        self.groups = []          # (centre x, half width, half height, members)
+        self.attached = np.zeros(n, bool)     # straggler drawn parked at a block's free slot
+
+        geo = []                               # [members, k, centre x, inward, row shift]
         for g in groups:
             g = sorted(int(i) for i in g)
-            k = len(g)
+            m = float(op[g].mean())
+            geo.append([g, len(g), float(X(m)), 1 if m <= 0.5 else -1, 0.0])
+        multi = [G for G in geo if G[1] > 10]
+
+        # one shared row grid inside each run of overlapping single-column stacks
+        stacks = [G for G in geo if 2 <= G[1] <= 10]
+        runs, run = [], []
+        for G in stacks:
+            if run and G[2] - run[-1][2] < RECT_W + 1.0:
+                run.append(G)
+            else:
+                if len(run) > 1:
+                    runs.append(run)
+                run = [G]
+        if len(run) > 1:
+            runs.append(run)
+        for run in runs:
+            if any(abs(G[2] - B[2]) < (math.ceil(B[1] / 10) - 1) / 2 * COL_PITCH + RECT_W
+                   for G in run for B in multi):
+                continue                       # leans on a big block: leave as is
+            odd = [G for G in run if G[1] % 2]
+            even = [G for G in run if not G[1] % 2]
+            if odd and even:
+                # single rects touching the run sit on the row line: they vote for odd rows
+                touch = sum(1 for G in geo if G[1] == 1 and
+                            any(abs(G[2] - S[2]) < RECT_W + 1.0 for S in run))
+                for G in (odd if len(odd) + touch < len(even) else even):
+                    G[4] = -ROW_PITCH / 2
+
+        self.groups = []          # (centre x, half width, half height, members)
+        for g, k, xm, inward, dy in geo:
             self.gsize[g] = k
+            S = np.array([_slot_xy(j, k, xm, inward) for j in range(k)])
+            S[:, 1] += dy
+            if k == 1:
+                pick = [0]
+            else:
+                # canonical order: from the outer side inward (ties: by index)
+                key = np.array(g, float) if prev_pos is None else prev_pos[0][g]
+                rank = np.empty(k)
+                rank[np.lexsort((np.array(g), inward * key))] = np.arange(k)
+                if prev_pos is None:
+                    pick = rank.astype(int)
+                else:
+                    px, py = prev_pos[0][g], prev_pos[1][g]
+                    cost = ((px[:, None] - S[None, :, 0]) ** 2 + (py[:, None] - S[None, :, 1]) ** 2
+                            + TIE * (rank[:, None] - np.arange(k)[None, :]) ** 2)
+                    _, pick = linear_sum_assignment(cost)
+                    pick = _cohere(pick, S, px, py)
+            self.wx[g] = S[pick, 0]
+            self.wy[g] = S[pick, 1]
             rows, cols = min(10, k), math.ceil(k / 10)
-            xm = float(X(op[g].mean()))
-            for s, i in enumerate(g):
-                c, r = divmod(s, 10)
-                self.wx[i] = xm + (c - (cols - 1) / 2) * COL_PITCH
-                self.wy[i] = Y0 + ((rows - 1) / 2 - r) * ROW_PITCH
             self.groups.append((xm, (cols - 1) / 2 * COL_PITCH + RECT_W / 2,
-                                (rows - 1) / 2 * ROW_PITCH + RECT_H / 2, g))
+                                (rows - 1) / 2 * ROW_PITCH + RECT_H / 2 + abs(dy), g))
+
+        # stragglers inside a multi-column block's footprint: park at its next free slot
+        used = {}
+        for gi, (g, k, xm, inward, dy) in enumerate(geo):
+            if k != 1:
+                continue
+            for bi, (_, bk, bx, binw, _) in enumerate(geo):
+                hw = (math.ceil(bk / 10) - 1) / 2 * COL_PITCH + RECT_W / 2
+                if bk > 10 and abs(xm - bx) < hw:
+                    j = bk + used.get(bi, 0)
+                    used[bi] = used.get(bi, 0) + 1
+                    sx, sy = _slot_xy(j, bk, bx, binw)
+                    side = math.copysign(1.0, xm - bx) if xm != bx else binw
+                    i = g[0]
+                    self.wx[i] = sx + side * min(max(abs(xm - bx), ATTACH_DX[0]), ATTACH_DX[1])
+                    self.wy[i] = sy - ATTACH_LIFT
+                    self.attached[i] = True
+                    self.groups[gi] = (float(self.wx[i]), RECT_W / 2, RECT_H / 2, g)
+                    break
+
+
+def layout_seq(ops, first=None):
+    """Layouts of consecutive states, each assigned against the one before (see Layout).
+    `first` (a Layout of ops[0]) lets a sequence continue from a state already on screen."""
+    ops = [np.asarray(x, dtype=np.float64) for x in ops]
+    if first is not None:
+        assert np.array_equal(first.op, ops[0]), "sequence must start from first's state"
+        out = [first]
+    else:
+        out = [Layout(ops[0])]
+    for x in ops[1:]:
+        out.append(Layout(x, prev=out[-1]))
+    return out
 
 
 # ----------------------------------------------------------------------------- scene
@@ -180,27 +373,45 @@ def _box_cov(x0, y0, x1, y1, w, h, hx=0.0, hy=0.0):
     return sx[0], sx[1], sy[0], sy[1], sy[2][:, None] * sx[2][None, :]
 
 
-def _seg_cov(x0, y0, x1, y1, width, w, h):
-    """Anti-aliased coverage of a segment of the given width (distance field)."""
+SEG_SMEAR_STEP = 0.75   # px between the sampled positions of a smeared diagonal segment
+
+
+def _seg_cov(x0, y0, x1, y1, width, w, h, hx=0.0, hy=0.0, gamma=1.0):
+    """Anti-aliased coverage of a segment of the given width (distance field).
+    (hx, hy) != 0: time-averaged coverage while the segment slides uniformly from -(hx, hy) to
+    +(hx, hy) (signed): motion blur for diagonal lines, sampled every SEG_SMEAR_STEP px.
+    gamma > 1 averages the samples as cov**gamma (then takes the root): coverage becomes an
+    sRGB value, and motion-blur sub-frames are averaged in linear light, so this keeps the smear
+    of a thin line even across sub-frame boundaries instead of dimming there."""
     hw = width / 2.0
     pad = hw + 1.5
-    i0, i1 = max(int(math.floor(min(x0, x1) - pad)), 0), min(int(math.ceil(max(x0, x1) + pad)), w)
-    j0, j1 = max(int(math.floor(min(y0, y1) - pad)), 0), min(int(math.ceil(max(y0, y1) + pad)), h)
+    ax, ay = abs(hx), abs(hy)
+    i0 = max(int(math.floor(min(x0, x1) - ax - pad)), 0)
+    i1 = min(int(math.ceil(max(x0, x1) + ax + pad)), w)
+    j0 = max(int(math.floor(min(y0, y1) - ay - pad)), 0)
+    j1 = min(int(math.ceil(max(y0, y1) + ay + pad)), h)
     if i1 <= i0 or j1 <= j0:
         return None
     px = np.arange(i0, i1, dtype=np.float32)[None, :] + 0.5
     py = np.arange(j0, j1, dtype=np.float32)[:, None] + 0.5
     dx, dy = x1 - x0, y1 - y0
     L2 = dx * dx + dy * dy
-    if L2 < 1e-9:
-        d = np.hypot(px - x0, py - y0)
-    else:
-        u = np.clip(((px - x0) * dx + (py - y0) * dy) / L2, 0.0, 1.0)
-        d = np.hypot(px - (x0 + u * dx), py - (y0 + u * dy))
-    if width >= 1.0:
-        cov = np.clip(hw + 0.5 - d, 0.0, 1.0)
-    else:
-        cov = width * np.clip(1.0 - d, 0.0, 1.0)
+    m = int(min(48, max(1, math.ceil(2.0 * math.hypot(hx, hy) / SEG_SMEAR_STEP))))
+    cov = np.zeros((j1 - j0, i1 - i0), np.float32)
+    for k in range(m):
+        o = (2.0 * (k + 0.5) / m - 1.0) if m > 1 else 0.0
+        sx, sy = x0 + o * hx, y0 + o * hy
+        if L2 < 1e-9:
+            d = np.hypot(px - sx, py - sy)
+        else:
+            u = np.clip(((px - sx) * dx + (py - sy) * dy) / L2, 0.0, 1.0)
+            d = np.hypot(px - (sx + u * dx), py - (sy + u * dy))
+        c = np.clip(hw + 0.5 - d, 0.0, 1.0) if width >= 1.0 else width * np.clip(1.0 - d, 0.0, 1.0)
+        cov += c if (m == 1 or gamma == 1.0) else c ** gamma
+    if m > 1:
+        cov *= 1.0 / m
+        if gamma != 1.0:
+            cov **= 1.0 / gamma
     return i0, i1, j0, j1, cov
 
 
@@ -241,7 +452,7 @@ class Raster:
                 rects.append((x - hw, y - hh, x + hw, y + hh, b["rgb"][i], lv[i], b["glow"][i], hx, hy))
         sm = getattr(sc, "line_smear", None)
         lines = [(l[0] * s, l[1] * s, l[2] * s, l[3] * s, max(l[4] * s, 0.35)) + l[5:8]
-                 + ((abs(sm[k][0]) * s / 2, abs(sm[k][1]) * s / 2) if sm else (0.0, 0.0))
+                 + ((sm[k][0] * s / 2, sm[k][1] * s / 2) if sm else (0.0, 0.0))   # signed half smear
                  for k, l in enumerate(sc.lines)]
         dots = [(d[0] * s, d[1] * s, max(d[2] * s, 0.6)) + d[3:] for d in sc.dots]
 
@@ -249,13 +460,13 @@ class Raster:
             sig_in = GLOW_SIGMA_IN * sc.zoom * s
             sig_out = GLOW_SIGMA_OUT * sc.zoom * s
             margin = 3.2 * sig_out + 4
-            xs0 = ([r[0] - r[7] for r in rects] + [min(l[0], l[2]) - l[4] - l[8] for l in lines]
+            xs0 = ([r[0] - r[7] for r in rects] + [min(l[0], l[2]) - l[4] - abs(l[8]) for l in lines]
                    + [d[0] - d[2] for d in dots])
-            xs1 = ([r[2] + r[7] for r in rects] + [max(l[0], l[2]) + l[4] + l[8] for l in lines]
+            xs1 = ([r[2] + r[7] for r in rects] + [max(l[0], l[2]) + l[4] + abs(l[8]) for l in lines]
                    + [d[0] + d[2] for d in dots])
-            ys0 = ([r[1] - r[8] for r in rects] + [min(l[1], l[3]) - l[4] - l[9] for l in lines]
+            ys0 = ([r[1] - r[8] for r in rects] + [min(l[1], l[3]) - l[4] - abs(l[9]) for l in lines]
                    + [d[1] - d[2] for d in dots])
-            ys1 = ([r[3] + r[8] for r in rects] + [max(l[1], l[3]) + l[4] + l[9] for l in lines]
+            ys1 = ([r[3] + r[8] for r in rects] + [max(l[1], l[3]) + l[4] + abs(l[9]) for l in lines]
                    + [d[1] + d[2] for d in dots])
             bx0 = max(0, int(math.floor(min(xs0) - margin)) // q * q)
             by0 = max(0, int(math.floor(min(ys0) - margin)) // q * q)
@@ -372,6 +583,12 @@ class Raster:
         else:
             up = G[pad:pad + bh, pad:pad + bw]
         np.maximum(up, 0.0, out=up)
+        m = up.max(axis=2)
+        hot = m > GLOW_KNEE
+        if hot.any():
+            mh = m[hot]
+            room = GLOW_CEIL - GLOW_KNEE
+            up[hot] *= ((GLOW_KNEE + room * (1.0 - np.exp(-(mh - GLOW_KNEE) / room))) / mh)[:, None]
         up *= (1.0 - alpha)[..., None]
         rgb += up
         np.clip(rgb, 0.0, 1.0, out=rgb)
@@ -385,11 +602,11 @@ class Raster:
         if abs(x1 - x0) < 1e-6 or abs(y1 - y0) < 1e-6:   # axis aligned -> crisp box (motion-blurred)
             hw = wd / 2.0
             if abs(x1 - x0) < 1e-6:
-                c = _box_cov(x0 - hw, min(y0, y1), x0 + hw, max(y0, y1), w, h, hx, hy)
+                c = _box_cov(x0 - hw, min(y0, y1), x0 + hw, max(y0, y1), w, h, abs(hx), abs(hy))
             else:
-                c = _box_cov(min(x0, x1), y0 - hw, max(x0, x1), y0 + hw, w, h, hx, hy)
-        else:
-            c = _seg_cov(x0, y0, x1, y1, wd, w, h)
+                c = _box_cov(min(x0, x1), y0 - hw, max(x0, x1), y0 + hw, w, h, abs(hx), abs(hy))
+        else:                                             # diagonal: sampled smear along (hx, hy)
+            c = _seg_cov(x0, y0, x1, y1, wd, w, h, hx, hy, 1.0 if additive else 2.2)
         if c is None:
             return
         i0, i1, j0, j1, cov = c

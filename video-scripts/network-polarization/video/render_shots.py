@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 import hk_sim  # noqa: E402
 
 from render_core import (GOLD, RECT_H, RECT_W, WHITE_GOLD, Y0, ROW_L, ROW_R,  # noqa: E402
-                         Layout, Scene, X, card_box, opinion_rgb)
+                         Layout, Scene, X, card_box, layout_seq, opinion_rgb)
 
 N = hk_sim.N
 X0 = np.asarray(hk_sim.X0, dtype=np.float64)
@@ -98,18 +98,20 @@ CAM1 = Cam()
 
 
 # ----------------------------------------------------------------------------- simulation
-WIDE = [Layout(x) for x in hk_sim.run(X0, 0.30)]                 # Experiment 1, rounds 0..4
+# Every state sequence is laid out round after round against the state before it (layout_seq),
+# so blocks keep their slots, and consecutive tweens share the very same Layout object.
+INIT = Layout(X0)                                                # the evenly spaced row
+WIDE = layout_seq(hk_sim.run(X0, 0.30), INIT)                    # Experiment 1, rounds 0..4
 _narrow = hk_sim.run(X0, 0.20)                                   # Experiment 2, rounds 0..7
-NARROW = [Layout(x) for x in _narrow]
+NARROW = layout_seq(_narrow, INIT)
 # S12 plays every round 1..7: in round 7 agents 49/50 make their last ~8 px move into the blocks.
 NSEQ = NARROW
-INIT = WIDE[0]
 DEMO1 = NARROW[1]                                                # S07: run(X0, 0.20)[1]
 
 BRIDGE_I = 49                     # top-right rect of the left 5x10 block
 _eps_b = np.full(N, 0.20)
 _eps_b[BRIDGE_I] = 0.40
-BRIDGE = [Layout(x) for x in hk_sim.run(_narrow[-1], _eps_b)]
+BRIDGE = layout_seq(hk_sim.run(_narrow[-1], _eps_b), NARROW[-1])  # starts from S13's end state
 MERGE_ROUND = next(k for k, L in enumerate(BRIDGE) if len(L.groups) == 1)
 LEFT = np.arange(N) < BRIDGE_I    # left block without the bridge
 RIGHT = np.arange(N) > BRIDGE_I
@@ -117,9 +119,14 @@ RIGHT = np.arange(N) > BRIDGE_I
 DEMO_I = 5
 NB5 = np.where(np.abs(X0 - X0[DEMO_I]) <= 0.20 + 1e-12)[0]
 MEAN5 = float(X0[NB5].mean())
+DEMO_LIFT = 46.0                  # S06: agent 5 rises this high to pass over its neighbours
 _x = X0.copy()
 _x[DEMO_I] = MEAN5
-MOVE5 = Layout(_x)
+_wy = INIT.wy.copy()
+_wy[DEMO_I] -= DEMO_LIFT          # it lands from above: it takes the top of the 2-stack
+MOVE5 = Layout(_x, prev_pos=(INIT.wx, _wy))
+_MATE = [i for i in range(N) if i != DEMO_I and MOVE5.gsize[i] > 1 and abs(MOVE5.op[i] - MEAN5) < 1e-9]
+DEMO_MATE = _MATE[0]              # agent 12: agent 5 lands on its opinion, they stack
 
 CARD_S04 = "你只听和你差不多的人"
 
@@ -144,8 +151,7 @@ class Ag:
     def tween(A, B, p):
         """Round tween at linear progress p: opinion/x/colour ease over the first 70 % of the
         window, y (stacking) over the last 45 %, so converging rects meet side by side and only
-        then stack (a simultaneous lerp draws diagonal '/' bars mid-tween, because stack slots
-        are filled in index order, which is also the order the rects arrive from)."""
+        then stack (a simultaneous x/y lerp draws diagonal '/' bars mid-tween)."""
         ex, ey = ease(p / 0.70), ease((p - 0.55) / 0.45)
         return Ag(A.op + (B.op - A.op) * ex, A.wx + (B.wx - A.wx) * ex, A.wy + (B.wy - A.wy) * ey)
 
@@ -259,7 +265,7 @@ def bracket(sc, cam, xc, eps, opacity, layout=None, alpha=0.7, glow=0.35, half=N
                     half = max(half, hh + 30.0)
     a = alpha * opacity
     y0, y1 = float(cam.y(Y0 - half)), float(cam.y(Y0 + half))
-    tick = 12.0 * cam.z ** 0.5
+    tick = min(12.0 * cam.z ** 0.5, 0.3 * float(cam.x(R) - cam.x(L)))   # narrow: ticks don't meet
     for xe, d in ((L, 1.0), (R, -1.0)):
         sx = float(cam.x(xe))
         sc.line(sx, y0 - 1, sx, y1, 2.0, GOLD, a, glow)
@@ -347,35 +353,93 @@ def s04(sh, t, sc):
     sc.text("card_s04", CARD_S04, window_fade(t, E["card"], 0.5))
 
 
-S05_CAM = Cam(1.8, float(X(0.13)))
+S05_CAM = Cam(1.8, float(X(X0[DEMO_I])))   # centred on agent 5; both bracket edges stay in frame
+DEMO_DIM = 0.15                  # S05-S07: the other rects sit this much lower than agent 5 ...
+DEMO_GLOW = 0.5                  # ... and agent 5's glow is this much stronger
+EPS_TIGHT = (RECT_W / 2 + 2.5) / 1600.0   # bracket hugging agent 5 alone, before it opens
+
+
+def demo_focus(sh_s05, t):
+    """0 -> 1 as the S05 zoom lands on agent 5 (it stays 1 through S06 until S07's reset)."""
+    z1 = sh_s05["events"]["zoom_in"][1]
+    return smooth(prog(t, (z1 - 0.3, z1 + 0.5)))
+
+
+def demo_marker(sc, cam, wx, wy, o):
+    """A small gold caret just above agent 5, following it: says which rect 「它」 is without
+    touching its opinion colour."""
+    if o <= 1e-3:
+        return
+    tip = wy - RECT_H / 2 - 8.0
+    x, ty = float(cam.x(wx)), float(cam.y(tip))
+    dx, dy = 6.0 * cam.z, 6.0 * cam.z
+    sc.line(x - dx, ty - dy, x, ty, 2.0, GOLD, 0.9 * o, 0.6)
+    sc.line(x + dx, ty - dy, x, ty, 2.0, GOLD, 0.9 * o, 0.6)
+
+
+def focus_look(a, f, others=None):
+    """Agent 5 at full brightness with a stronger glow; the others a touch lower."""
+    a.level = a.level * (1 - DEMO_DIM * f) if others is None else others * (1 - DEMO_DIM * f)
+    a.level[DEMO_I] = 1.0
+    a.glow[DEMO_I] = 1.0 + DEMO_GLOW * f
 
 
 def s05(sh, t, sc):
     E = sh["events"]
     e = ease_sine(prog(t, E["zoom_in"]))      # sine: half the peak speed of easeInOutCubic
     cam = Cam(1 + (S05_CAM.z - 1) * e, 960 + (S05_CAM.cx - 960) * e)
-    pb = prog(t, E["bracket_in"])
-    eb = ease(pb)
+    f = demo_focus(sh, t)
+    # the bracket opens out of agent 5: it appears hugging agent 5 alone (everyone else dims),
+    # then its edges sweep out to eps = 0.20 and the rects they pass light back up
+    b0, b1 = E["bracket_in"]
+    o = smooth(prog(t, (b0 - 0.8, b0 - 0.3)))
+    pw = prog(t, (b0 - 0.3, b1 + 0.4))
+    eps = EPS_TIGHT + (0.20 - EPS_TIGHT) * ease_sine(pw)
     a = Ag.of(INIT)
-    a.level = 1 - 0.8 * eb * (1 - inside(a.op, X0[DEMO_I], 0.20))
+    ins = inside(a.op, X0[DEMO_I], eps, soft=0.0004 + 0.004 * (1 - smooth(pw)))
+    focus_look(a, f, 1 - 0.8 * o * (1 - ins))
     a.emit(sc, cam)
-    bracket(sc, cam, X0[DEMO_I], 0.20 * eb, smooth(pb * 3), INIT, snap=settle(pb, head=False))
+    bracket(sc, cam, X0[DEMO_I], eps, o, INIT, snap=settle(pw, head=False))
+    demo_marker(sc, cam, a.wx[DEMO_I], a.wy[DEMO_I], f)
     sc.zoom = cam.z
 
 
 POINT_RGB = 0.55 * opinion_rgb(MEAN5) + 0.45
 
 
+MATE_SETTLE = 0.20     # agent 12 makes room in the 2-stack only in this last part of the move
+
+
+def demo_move(p, back=False):
+    """S06 move of agent 5 onto agent 12 at linear progress p (back=True: S07's reset, the same
+    path played in reverse). Nobody else moves; agent 12 settles into the 2-stack only as
+    agent 5 lands (and leaves it as soon as agent 5 takes off again)."""
+    a = Ag.of(INIT)
+    e = ease(p)
+    u = 1 - e if back else e                   # 0 = start of the row, 1 = landed on agent 12
+    i, m = DEMO_I, DEMO_MATE
+    # rise clear of the neighbours, travel, then drop onto agent 12 (no clipping through rects)
+    ux = smooth((u - 0.1) / 0.8)
+    lift = DEMO_LIFT * smooth(u / 0.25) * (1 - smooth((u - 0.75) / 0.25))
+    a.op[i] = INIT.op[i] + (MOVE5.op[i] - INIT.op[i]) * ux
+    a.wx[i] = INIT.wx[i] + (MOVE5.wx[i] - INIT.wx[i]) * ux
+    a.wy[i] = INIT.wy[i] + (MOVE5.wy[i] - INIT.wy[i]) * smooth(u) - lift
+    s = 1 - smooth(p / MATE_SETTLE) if back else smooth((p - 1 + MATE_SETTLE) / MATE_SETTLE)
+    a.wy[m] = INIT.wy[m] + (MOVE5.wy[m] - INIT.wy[m]) * s
+    if abs(a.wx[i] - a.wx[m]) < RECT_W + 4.0:          # above agent 12: rest on it, a row up
+        a.wy[i] = min(a.wy[i], a.wy[m] - (MOVE5.wy[m] - MOVE5.wy[i]))
+    return a
+
+
 def s06(sh, t, sc):
     E = sh["events"]
     cam = S05_CAM
     m0, m1 = E["move"]
-    em = ease(prog(t, E["move"]))
-    a = Ag.mix(INIT, MOVE5, em)
-    a.wy[DEMO_I] -= 46.0 * math.sin(math.pi * em)      # lift over its neighbours, then land
+    a = demo_move(prog(t, E["move"]))
     ins = inside(X0, X0[DEMO_I], 0.20)
-    a.level = 1 - 0.8 * (1 - ins)
+    focus_look(a, 1.0, 1 - 0.8 * (1 - ins))
     a.emit(sc, cam)
+    demo_marker(sc, cam, a.wx[DEMO_I], a.wy[DEMO_I], 1.0)
     bracket(sc, cam, X0[DEMO_I], 0.20, 1.0, INIT)
     r0, r1 = E["rays"]
     D = r1 - r0
@@ -397,15 +461,18 @@ def s07(sh, t, sc):
     E = sh["events"]
     ez = ease_sine(prog(t, E["zoom_out"]))
     cam = Cam(S05_CAM.z + (1 - S05_CAM.z) * ez, S05_CAM.cx + (960 - S05_CAM.cx) * ez)
-    er = ease(prog(t, E["reset_demo"]))
+    pr = prog(t, E["reset_demo"])
+    er = ease(pr)
     if t < E["round:1"][0]:
-        a = Ag.mix(MOVE5, INIT, er)
+        a = demo_move(pr, back=True)
     elif t < E["rewind"][0]:
         a = Ag.tween(INIT, DEMO1, prog(t, E["round:1"]))
     else:
         a = Ag.mix(DEMO1, INIT, ease(prog(t, E["rewind"])))
-    a.level = 1 - 0.8 * (1 - er) * (1 - inside(X0, X0[DEMO_I], 0.20))
+    focus_look(a, 1 - er, 1 - 0.8 * (1 - er) * (1 - inside(X0, X0[DEMO_I], 0.20)))
     a.emit(sc, cam)
+    if t < E["round:1"][0]:
+        demo_marker(sc, cam, a.wx[DEMO_I], a.wy[DEMO_I], 1 - smooth(pr / 0.7))
     bracket(sc, cam, X0[DEMO_I], 0.20, 1 - er, INIT)
     pf = prog(t, E["flash"])
     if 0 < pf < 1:
@@ -441,34 +508,54 @@ def s10(sh, t, sc):
     sc.glow_gain = 1.0 + 0.4 * bump(prog(t, sh["events"]["glow"]))
 
 
-def _pchip(keys):
-    """Monotone cubic (Fritsch-Butland) through keyframes at u = 0, 1, 2, ...: velocity is
-    continuous across keyframes and nothing overshoots. Returns f(u) -> array."""
-    Y = np.asarray(keys, dtype=np.float64)
-    d = np.diff(Y, axis=0)
-    m = np.empty_like(Y)
-    m[0], m[-1] = d[0], d[-1]
-    a, b = d[:-1], d[1:]
-    same = a * b > 0
-    m[1:-1] = np.where(same, 2 * a * b / np.where(same, a + b, 1.0), 0.0)
+class Rewind:
+    """A round sequence played backwards as one continuous motion. Each forward round moves x
+    (and opinion) first and stacks (y) after, so backwards each round un-stacks first and then
+    slides x back: the rects retrace the forward rounds and never cut diagonally across a block.
+    Every one-axis move gets its own smoothstep window, as long as its largest displacement
+    needs, and consecutive windows overlap a little, so the motion never stops dead between
+    rounds (the speed only dips to ~40 % of its peak at each turn) while a column that is still
+    un-stacking has barely started to slide sideways (no tilted '/' columns)."""
 
-    def f(u):
-        k = int(min(max(math.floor(u), 0), len(Y) - 2))
-        s = min(max(u - k, 0.0), 1.0)
-        s2, s3 = s * s, s * s * s
-        return ((2 * s3 - 3 * s2 + 1) * Y[k] + (s3 - 2 * s2 + s) * m[k]
-                + (-2 * s3 + 3 * s2) * Y[k + 1] + (s3 - s2) * m[k + 1])
-    return f
+    OVERLAP = 0.15                 # fraction of the shorter of two neighbouring windows
+
+    def __init__(self, seq):
+        self.end = seq[-1]
+        moves = []                 # (d_op, d_wx, d_wy, length)
+        for k in range(len(seq) - 1, 0, -1):
+            A, B = seq[k], seq[k - 1]
+            dy = B.wy - A.wy
+            if np.abs(dy).max() > 0.5:
+                moves.append((0.0, 0.0, dy, np.abs(dy).max()))
+            dx = B.wx - A.wx
+            if np.abs(dx).max() > 0.5 or np.abs(B.op - A.op).max() > 1e-9:
+                moves.append((B.op - A.op, dx, 0.0, np.abs(dx).max()))
+        lens = [max(m[3], 20.0) ** 0.6 for m in moves]
+        wins, t = [], 0.0
+        for k, L in enumerate(lens):
+            if k:
+                t -= self.OVERLAP * min(L, lens[k - 1])
+            wins.append((t, t + L))
+            t += L
+        self.moves = [(m[0], m[1], m[2], (a / t, b / t)) for m, (a, b) in zip(moves, wins)]
+
+    def at(self, u):
+        """u = 0: the last state of seq; u = 1: back at its first state."""
+        op, wx, wy = self.end.op.copy(), self.end.wx.copy(), self.end.wy.copy()
+        for dop, dx, dy, win in self.moves:
+            e = smooth(prog(u, win))
+            op += dop * e
+            wx += dx * e
+            wy += dy * e
+        return Ag(op, wx, wy)
 
 
-# S11 rewind: one continuous motion back through wide rounds 4 -> 0 (no stop at each round)
-_REWIND = [_pchip([L.op for L in WIDE]), _pchip([L.wx for L in WIDE]), _pchip([L.wy for L in WIDE])]
+REWIND = Rewind(WIDE)               # S11: the consensus block un-builds back to the spectrum
 
 
 def s11(sh, t, sc):
     E = sh["events"]
-    u = (len(WIDE) - 1) * (1 - ease_sine(prog(t, E["rewind"])))   # play rounds 4 -> 0 backwards
-    a = Ag(*(f(u) for f in _REWIND))
+    a = REWIND.at(ease_sine(prog(t, E["rewind"])))
     pin = prog(t, E["bracket_in"])
     ein = ease(pin)
     pn = prog(t, E["narrow"])
