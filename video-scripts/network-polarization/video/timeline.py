@@ -1,15 +1,13 @@
-"""Shot timing for the video: the one schedule picture, voice and music all follow.
+"""Shot timing for the video: the one schedule picture and music both follow.
 
-    python3 timeline.py --lines   -> BUILD/lines.json   (narration chunks for TTS)
-    python3 timeline.py           -> BUILD/timeline.json
+    python3 timeline.py   -> BUILD/timeline.json
 
-Shot lengths come from script.md, stretched when the recorded narration is longer.
-If BUILD/voice/durations.json is missing, narration length is estimated.
-All times in timeline.json are absolute seconds from the start of the video.
+The video has no voice-over; the script's narration appears as on-screen captions.
+Shot lengths come from script.md, stretched when a shot's captions need more
+reading time. All times in timeline.json are absolute seconds from the start.
 """
 import json
 import os
-import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.environ.get(
@@ -19,8 +17,8 @@ BUILD = os.environ.get(
 )
 FPS = 30
 
-# Each chunk is one subtitle and one TTS file. Commas stay inside a chunk.
-# A chunk given as (text, False) is spoken but not subtitled (a title card shows it).
+# Each chunk is one caption. A chunk given as (text, False) gets no caption
+# because a title card shows the same words.
 SHOTS = [
     dict(id="S01", ch=1, base=3.0, chunks=[]),
     dict(id="S02", ch=1, base=6.0, lead=0.8, tail=1.0,
@@ -39,7 +37,7 @@ SHOTS = [
          chunks=["第一次实验：每个人愿意听的范围，宽一些。"]),
     dict(id="S09", ch=3, base=10.0, lead=0.4,
          chunks=["最先动的，是两头的人。", "然后，整排人一点点向中间收拢。"]),
-    dict(id="S10", ch=3, base=6.0, lead=0.3, tail=2.0,
+    dict(id="S10", ch=3, base=6.0, lead=0.3, tail=1.7,
          chunks=["第四轮。", "一百个人，站到了一起。"]),
     dict(id="S11", ch=4, base=10.0, lead=0.4,
          chunks=["同样的人，同样的起点，同样的规则。", "只改一件事：把这个范围，收窄三分之一。"]),
@@ -47,11 +45,11 @@ SHOTS = [
          chunks=["人们仍然在靠近。", "只是，只靠近身边的人。", "中间的几个人，被两边各自拉走。"]),
     dict(id="S13", ch=4, base=5.0, lead=0.3, tail=1.2,
          chunks=["第六轮之后，再也没有任何变化。"]),
-    dict(id="S14", ch=4, base=12.0, lead=0.6, gap=0.55, tail=3.5,
+    dict(id="S14", ch=4, base=12.0, lead=0.6, gap=0.55, tail=3.2,
          chunks=["没有人撒谎。", "没有人被收买。", "没有人是坏人。", "大家只是，都在听和自己差不多的人。"]),
     dict(id="S15", ch=5, base=7.0, lead=0.8,
          chunks=["现实里没有这个旋钮。", "但有很多东西，在悄悄收窄括号。"]),
-    dict(id="S16", ch=5, base=14.0, lead=0.3, tail=0.5, beats=3.5,
+    dict(id="S16", ch=5, base=13.0, lead=0.3, tail=0.5, beats=3.0,
          chunks=["推荐算法，喂你爱看的。", "关注列表，是你亲手挑的。", "拉黑，让一种颜色消失。", "评论区，先问你站哪边。"]),
     dict(id="S17", ch=5, base=9.0, lead=0.4,
          chunks=["它们未必为分裂而设计。", "但它们都让我们，更容易只听见差不多的人。"]),
@@ -63,7 +61,7 @@ SHOTS = [
          chunks=["很久，几乎什么也没发生。", "然后，裂缝合上了。"]),
     dict(id="S21", ch=6, base=8.0, lead=0.4,
          chunks=["这并不总能成功。", "两边离得太远，就没有人能同时被两边听见。"]),
-    dict(id="S22", ch=6, base=10.0, lead=1.4, tail=7.6,
+    dict(id="S22", ch=6, base=10.0, lead=1.0, tail=6.6,
          chunks=["你最近一次，认真听完一个反对意见，是什么时候？"]),
 ]
 
@@ -94,14 +92,15 @@ ANNOTATIONS = {
     "S20": [("ROUND {r} · BRIDGE ε = 0.40 · OTHERS ε = 0.20", 0.0, "merge1"),
             ("MERGED AT ROUND 36 · THE SPLIT TOOK 6", "merge1", None)],
     "S21": "REQUIRES GAP ≤ 2ε · HERE 0.39 ≤ 0.40",
-    "S22": [("ε = ?", 0.6, "c1e+1.0"),
+    "S22": [("ε = ?", 0.6, "c1e+0.8"),
             ("Hegselmann & Krause, JASSS 5(3), 2002 · SIMULATION: N = 100, EVENLY SPACED START",
-             "c1e+1.2", "c1e+4.6")],
+             "c1e+1.0", "c1e+3.6")],
 }
 
 
-def estimate(text):
-    return 0.35 + len(text) / 4.2
+def reading_time(text):
+    """Seconds a caption stays up: unhurried reading, well under subtitle-speed limits."""
+    return 0.6 + len(text) / 6.5
 
 
 def rounds(first, last, t0, t1, frac=0.75, accel=1.0):
@@ -181,7 +180,7 @@ def shot_events(sid, d, c):
                 "break": [b, b + 0.3], "diagram_out": [d - 1.4, d - 0.6], "undim": [d - 1.0, d - 0.2]}
     if sid == "S22":
         e = ce(1)
-        return {"collapse": [0.0, 1.4], "card": [cs(1) - 0.2, e + 4.6], "black": [e + 4.6, e + 5.2]}
+        return {"collapse": [0.0, 1.4], "card": [cs(1) - 0.2, e + 3.6], "black": [e + 3.6, e + 4.2]}
     return {}
 
 
@@ -202,13 +201,13 @@ def resolve(spec, c, ev, d):
     return t + (float(off) if off else 0.0)
 
 
-def build(durations):
+def build():
     t = 0.0
     shots = []
     for s in SHOTS:
         lead, gap, tail = s.get("lead", 0.5), s.get("gap", 0.4), s.get("tail", 0.8)
         items = [(x, True) if isinstance(x, str) else x for x in s["chunks"]]
-        lens = [durations.get(f"{s['id']}_{k}", estimate(txt)) for k, (txt, _) in enumerate(items)]
+        lens = [reading_time(txt) for txt, _ in items]
         c, cur = [], lead
         for k, L in enumerate(lens):
             if "beats" in s:
@@ -238,34 +237,22 @@ def build(durations):
 
         shots.append({
             "id": s["id"], "chapter": s["ch"], "start": t, "end": t + d,
-            "narration": [{"id": f"{s['id']}_{k}", "text": txt, "subtitle": sub,
-                           "start": t + a, "end": t + b,
-                           "wav": f"voice/{s['id']}_{k}.wav"}
-                          for k, ((txt, sub), (a, b)) in enumerate(zip(items, c))],
+            "captions": [{"id": f"{s['id']}_{k}", "text": txt, "show": sub,
+                          "start": t + a, "end": t + b}
+                         for k, ((txt, sub), (a, b)) in enumerate(zip(items, c))],
             "annotations": anns,
             "events": {k: [t + v[0], t + v[1]] for k, v in ev.items()},
         })
         t += d
-    return {"fps": FPS, "width": 1920, "height": 1080, "duration": t,
-            "estimated": not durations, "shots": shots}
+    return {"fps": FPS, "width": 1920, "height": 1080, "duration": t, "shots": shots}
 
 
 if __name__ == "__main__":
     os.makedirs(BUILD, exist_ok=True)
-    if "--lines" in sys.argv:
-        lines = [{"id": f"{s['id']}_{k}", "text": x if isinstance(x, str) else x[0]}
-                 for s in SHOTS for k, x in enumerate(s["chunks"])]
-        with open(os.path.join(BUILD, "lines.json"), "w") as f:
-            json.dump(lines, f, ensure_ascii=False, indent=1)
-        print(f"{len(lines)} chunks -> {BUILD}/lines.json")
-        sys.exit()
-    dpath = os.path.join(BUILD, "voice", "durations.json")
-    durations = json.load(open(dpath)) if os.path.exists(dpath) else {}
-    tl = build(durations)
+    tl = build()
     with open(os.path.join(BUILD, "timeline.json"), "w") as f:
         json.dump(tl, f, ensure_ascii=False, indent=1)
     m, s = divmod(tl["duration"], 60)
-    print(f"{'ESTIMATED' if tl['estimated'] else 'measured'} durations · "
-          f"total {int(m)}:{s:05.2f} · {len(tl['shots'])} shots -> {BUILD}/timeline.json")
+    print(f"total {int(m)}:{s:05.2f} · {len(tl['shots'])} shots -> {BUILD}/timeline.json")
     for sh in tl["shots"]:
         print(f"  {sh['id']} {sh['start']:7.2f}–{sh['end']:7.2f} ({sh['end'] - sh['start']:.2f}s)")
