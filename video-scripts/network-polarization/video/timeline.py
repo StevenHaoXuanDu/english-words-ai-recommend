@@ -44,7 +44,7 @@ SHOTS = [
     dict(id="S12", ch=4, base=9.0, lead=0.3, gap=0.25, tail=0.6,
          chunks=["人们仍然在靠近。", "只是，只靠近身边的人。", "中间的几个人，被两边各自拉走。"]),
     dict(id="S13", ch=4, base=5.0, lead=0.3, tail=1.2,
-         chunks=["第六轮之后，再也没有任何变化。"]),
+         chunks=["第七轮之后，再也没有任何变化。"]),
     dict(id="S14", ch=4, base=12.0, lead=0.6, gap=0.55, tail=3.2,
          chunks=["没有人撒谎。", "没有人被收买。", "没有人是坏人。", "大家只是，都在听和自己差不多的人。"]),
     dict(id="S15", ch=5, base=7.0, lead=0.8,
@@ -62,7 +62,7 @@ SHOTS = [
     dict(id="S21", ch=6, base=8.0, lead=0.4,
          chunks=["这并不总能成功。", "两边离得太远，就没有人能同时被两边听见。"]),
     dict(id="S22", ch=6, base=10.0, lead=1.0, tail=6.6,
-         chunks=["你最近一次，认真听完一个反对意见，是什么时候？"]),
+         chunks=[("你最近一次，认真听完一个反对意见，是什么时候？", False)]),
 ]
 
 # Bottom annotations. A string covers the whole shot; a list of (text, start, end)
@@ -80,7 +80,7 @@ ANNOTATIONS = {
     "S09": "ROUND 1 → 3 · SPREAD 1.00 → 0.71 → 0.46 → 0.29",
     "S10": "ROUND 4 · CONSENSUS · 1 CLUSTER · x = 0.50",
     "S11": "EXPERIMENT 2 · ε = 0.30 → 0.20",
-    "S12": "ROUND 3 → 6 · GROUPS 9 → 8 → 4 → 2",
+    "S12": "ROUND 3 → 7 · GROUPS 9 → 8 → 4 → 2 → 2",
     "S13": "ROUND {r} · 2 CLUSTERS · 50 | 50 · GAP 0.39 > ε",
     "S14": "NO VILLAINS · SAME PEOPLE · SAME RULE · NARROWER ε",
     "S15": "REAL WORLD · NO SINGLE ε",
@@ -90,7 +90,7 @@ ANNOTATIONS = {
     "S18": "1 AGENT · ε : 0.20 → 0.40 · EVERYONE ELSE UNCHANGED",
     "S19": "ROUND 1 · BRIDGE x = 0.50 · DISTANCE 0.19 ≤ ε, BOTH SIDES",
     "S20": [("ROUND {r} · BRIDGE ε = 0.40 · OTHERS ε = 0.20", 0.0, "merge1"),
-            ("MERGED AT ROUND 36 · THE SPLIT TOOK 6", "merge1", None)],
+            ("MERGED AT ROUND 36 · THE SPLIT SETTLED AT ROUND 7", "merge1", None)],
     "S21": "REQUIRES GAP ≤ 2ε · HERE 0.39 ≤ 0.40",
     "S22": [("ε = ?", 0.6, "c1e+0.8"),
             ("Hegselmann & Krause, JASSS 5(3), 2002 · SIMULATION: N = 100, EVENLY SPACED START",
@@ -133,8 +133,8 @@ def shot_events(sid, d, c):
     if sid == "S06":
         return {"rays": [cs(1) + 0.6, cs(1) + 2.2], "move": [cs(1) + 2.4, ce(1) + 0.2]}
     if sid == "S07":
-        return {"zoom_out": [0.0, 1.2], "reset_demo": [0.0, 1.0], "flash": [1.2, 2.2],
-                "round:1": [2.3, 4.1], "rewind": [d - 1.6, d - 0.3]}
+        return {"zoom_out": [0.0, 2.2], "reset_demo": [0.0, 1.6], "flash": [2.2, 3.0],
+                "round:1": [3.1, 4.7], "rewind": [d - 1.5, d - 0.3]}
     if sid == "S08":
         return {"bracket_in": [0.3, 1.3], "bracket_out": [d - 1.0, d - 0.2]}
     if sid == "S09":
@@ -147,7 +147,7 @@ def shot_events(sid, d, c):
                 "narrow": [cs(2) + 0.35 * dur2, ce(2)]}
     if sid == "S12":
         ev = {"bracket_out": [0.0, 0.5]}
-        ev.update(rounds(1, 6, 0.4, d - 0.3, frac=0.75))
+        ev.update(rounds(1, 7, 0.4, d - 0.3, frac=0.75))
         return ev
     if sid == "S13":
         return {"fast_forward": [0.8, d - 0.6]}
@@ -229,7 +229,7 @@ def build():
             entry = {"text": text, "start": t + a, "end": t + b}
             if "{r}" in text:
                 if s["id"] == "S13":
-                    entry["counter"] = {"from": 6, "to": 100,
+                    entry["counter"] = {"from": 7, "to": 100,
                                         "t0": t + ev["fast_forward"][0], "t1": t + ev["fast_forward"][1]}
                 else:  # S20 follows the round tweens; renderer shows the round being entered
                     entry["counter"] = {"rounds": "events"}
