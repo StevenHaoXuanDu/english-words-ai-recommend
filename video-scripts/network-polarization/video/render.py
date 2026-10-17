@@ -8,6 +8,12 @@
 
 Reads timeline.json (--timeline to override) at run time; every opinion and
 position comes from ../hk_sim.py (see render_shots.py).
+
+Each frame: render_fx.Background (nebula, parallax dust, opinion axis, light effects)
+-> the data layer (render_core.Raster, motion-blurred when anything moves) composited
+over it in linear light -> render_text (animated captions, annotations, cards, chapter
+labels, HUD). Global motion (drift, ambient life, round pulses, trails) is in
+render_motion; per-shot choreography in render_shots.
 """
 import argparse
 import collections
@@ -28,6 +34,9 @@ BUILD = os.environ.get(
     "4af3582d-b5b8-57c7-bf82-51aca3b2d552/scratchpad/build",
 )
 DEFAULT_TIMELINE = os.path.join(BUILD, "timeline.json")
+# aq-mode 3 biases bits toward dark flat areas: the dithered background haze keeps its
+# smooth gradients instead of breaking into blocks (it still averages well under 60 MB)
+X264_PARAMS = "aq-mode=3:aq-strength=0.9"
 
 _show = None
 _raster = None
@@ -35,26 +44,43 @@ _fps = 30.0
 _mb = True
 
 
+_bg = None
+_text = None
+
+
 def _init(timeline_path, scale, mb=True, fps=None):
-    global _show, _raster, _fps, _mb
+    global _show, _raster, _fps, _mb, _bg, _text
     from render_core import Raster
+    from render_fx import Background
     from render_shots import Show
+    from render_text import TextFX
     with open(timeline_path) as f:
         _show = Show(json.load(f))
     _raster = Raster(scale)
+    _bg = Background(scale)
+    _text = TextFX(scale, _raster.W, _raster.H)
     _fps = float(fps or _show.fps)        # output frame rate sets the shutter interval
     _mb = mb
 
 
 def render_at(t):
-    """One output frame. When rects or lines move, it is motion-blurred over a 360 deg
-    shutter (Show.motion_bounds + Raster.render_blurred); otherwise a single render."""
+    """One output frame: background (render_fx), the data layer composited over it in linear
+    light, then the typography (render_text). When rects or lines move, the data layer is
+    motion-blurred over a 360 deg shutter (Show.motion_bounds + Raster.layers_blurred)."""
+    sc = _show.scene(t)
     bounds = _show.motion_bounds(t, _fps, _raster.s) if _mb else None
     if bounds is None:
-        return _raster.render(_show.scene(t))
-    mids = [0.5 * (a + b) for a, b in zip(bounds[:-1], bounds[1:])]
-    return _raster.render_blurred([_show.scene(u) for u in mids], [_show.scene(u) for u in bounds],
-                                  _show.scene(t))
+        layers = [_raster.layer(sc)]
+    else:
+        mids = [0.5 * (a + b) for a, b in zip(bounds[:-1], bounds[1:])]
+        layers = _raster.layers_blurred([_show.scene(u, False) for u in mids],
+                                        [_show.scene(u, False) for u in bounds])
+    h = 0.5 / _fps
+    cp, cn = _show.cam_at(t - h), _show.cam_at(t + h)
+    frame = _bg.draw(sc, t, _fps, cp, cn)
+    _raster.compose(frame, layers)
+    _text.draw(frame, sc.texts)
+    return frame
 
 
 def _frame(t):
@@ -94,6 +120,7 @@ def encode(args, fps, t0, t1):
            "-s", f"{w}x{h}", "-r", rate, "-i", "-", "-frames:v", str(n),
            "-vf", "scale=out_color_matrix=bt709:out_range=tv",
            "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+           "-x264-params", args.x264,
            "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
            "-r", rate, "-movflags", "+faststart", args.out]
     enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -130,6 +157,7 @@ def main():
     ap.add_argument("--bench", type=int, help="time N single-process frames spread over the video")
     ap.add_argument("--bench-at", help="comma-separated seconds to time (with --bench 1)")
     ap.add_argument("--no-mb", action="store_true", help="disable motion blur")
+    ap.add_argument("--x264", default=X264_PARAMS, help="libx264 parameters (default: %(default)s)")
     args = ap.parse_args()
 
     _init(args.timeline, args.scale, mb=not args.no_mb, fps=args.fps)

@@ -19,6 +19,7 @@ ROW_R = 1760.0 + RECT_W / 2 + 8
 
 GLOW_SIGMA_IN, GLOW_GAIN_IN = 6.0, 0.55     # "blur 12 px, 35 %" from the script, lifted
 GLOW_SIGMA_OUT, GLOW_GAIN_OUT = 26.0, 0.24  # wide faint bloom
+BODY_KNEE = 0.93                            # rect body: brightest channel rolls off above this
 GLOW_KNEE, GLOW_CEIL = 0.45, 0.80           # soft knee on the summed glow (brightest channel):
                                             # one rect, a row or a block stays below the knee
                                             # (glow <= 0.49); dense mid-tween piles roll off
@@ -313,24 +314,37 @@ def layout_seq(ops, first=None):
 
 # ----------------------------------------------------------------------------- scene
 class Scene:
-    """Primitives in design pixels (after camera). Raster draws them."""
+    """Primitives in design pixels (after camera). Raster draws them; render_fx draws the
+    background (cam, drift, axis, fx, spill) and render_text the texts."""
 
     def __init__(self):
-        self.rects = []      # dict(x, y, w, h, rgb(n,3), level(n), glow(n))
+        self.rects = []      # dict(x, y, w, h, rgb(n,3), level(n), glow(n), cam, life, smear)
         self.lines = []      # (x0, y0, x1, y1, width, rgb, alpha, glow)
         self.dots = []       # (x, y, radius, rgb, alpha, glow)
         self.zoom = 1.0      # scales glow radius
         self.glow_gain = 1.0
-        self.texts = []      # (kind, text, opacity)
+        self.texts = []      # (kind, text, opacity, params)
+        self.cam = (1.0, 960.0)          # main camera (zoom, centre x) of the shot
+        self.drift = (1.0, 0.0, 0.0)     # global camera drift (zoom, dx, dy), applied last
+        self.fx = []         # background light effects (render_fx.FX)
+        self.axis = None
+        self.bg_level = 1.0
+        self.fade = 1.0
 
-    def add_rects(self, x, y, w, h, rgb, level, glow):
+    def add_rects(self, x, y, w, h, rgb, level, glow, cam=None, life=False, smear=None):
+        """cam: (zoom, centre x) the batch was projected with (lets trails remove camera motion).
+        life: the batch gets the ambient breathing / shimmer. smear: fixed (sx, sy) smear in
+        design px (motion trails); such batches keep it under motion blur."""
         n = len(x)
-        self.rects.append(dict(x=np.asarray(x, float), y=np.asarray(y, float),
-                               w=np.broadcast_to(np.asarray(w, float), (n,)),
-                               h=np.broadcast_to(np.asarray(h, float), (n,)),
+        self.rects.append(dict(x=np.array(x, float), y=np.array(y, float),
+                               w=np.array(np.broadcast_to(np.asarray(w, float), (n,))),
+                               h=np.array(np.broadcast_to(np.asarray(h, float), (n,))),
                                rgb=np.asarray(rgb, float).reshape(n, 3),
-                               level=np.broadcast_to(np.asarray(level, float), (n,)),
-                               glow=np.broadcast_to(np.asarray(glow, float), (n,))))
+                               level=np.array(np.broadcast_to(np.asarray(level, float), (n,))),
+                               glow=np.array(np.broadcast_to(np.asarray(glow, float), (n,))),
+                               cam=cam, life=life, fixed=smear is not None))
+        if smear is not None:
+            self.rects[-1]["sx"], self.rects[-1]["sy"] = smear
 
     def line(self, x0, y0, x1, y1, width, rgb, alpha, glow=0.0):
         if alpha > 1e-3:
@@ -340,9 +354,9 @@ class Scene:
         if alpha > 1e-3:
             self.dots.append((x, y, r, np.asarray(rgb, float), alpha, glow))
 
-    def text(self, kind, text, opacity):
+    def text(self, kind, text, opacity, **params):
         if opacity > 1e-3:
-            self.texts.append((kind, text, float(min(1.0, opacity))))
+            self.texts.append((kind, text, float(min(1.0, opacity)), params))
 
 
 # ----------------------------------------------------------------------------- raster
@@ -434,10 +448,12 @@ class Raster:
         self.q = 4 if scale >= 0.75 else (2 if scale >= 0.4 else 1)  # glow downsample
         self.text = TextCache(scale, self.W, self.H)
 
-    # -- one frame ------------------------------------------------------------------
-    def render(self, sc, texts=True):
+    # -- data layer -----------------------------------------------------------------
+    def layer(self, sc):
+        """Rects, lines and dots of one scene over black: (box, rgb, alpha) with rgb the
+        premultiplied colour (glow included, additive) and alpha the body coverage, both
+        float32 over box = (x0, y0, x1, y1) raster px; None when nothing is drawn."""
         s, q = self.s, self.q
-        frame = np.zeros((self.H, self.W, 3), np.uint8)
         rects = []
         for b in sc.rects:
             lv = b["level"]
@@ -449,76 +465,85 @@ class Raster:
                 x, y = b["x"][i] * s, b["y"][i] * s
                 hx = abs(float(smx[i])) * s / 2 if smx is not None else 0.0
                 hy = abs(float(smy[i])) * s / 2 if smy is not None else 0.0
-                rects.append((x - hw, y - hh, x + hw, y + hh, b["rgb"][i], lv[i], b["glow"][i], hx, hy))
+                if x + hw + hx < -40 or x - hw - hx > self.W + 40 or y + hh + hy < -40 or y - hh - hy > self.H + 40:
+                    continue
+                rects.append((x - hw, y - hh, x + hw, y + hh, b["rgb"][i], lv[i], b["glow"][i], hx, hy,
+                              b.get("fixed", False)))
         sm = getattr(sc, "line_smear", None)
         lines = [(l[0] * s, l[1] * s, l[2] * s, l[3] * s, max(l[4] * s, 0.35)) + l[5:8]
                  + ((sm[k][0] * s / 2, sm[k][1] * s / 2) if sm else (0.0, 0.0))   # signed half smear
                  for k, l in enumerate(sc.lines)]
         dots = [(d[0] * s, d[1] * s, max(d[2] * s, 0.6)) + d[3:] for d in sc.dots]
+        if not (rects or lines or dots):
+            return None
+        sig_in = GLOW_SIGMA_IN * sc.zoom * s
+        sig_out = GLOW_SIGMA_OUT * sc.zoom * s
+        margin = 3.2 * sig_out + 4
+        xs0 = ([r[0] - r[7] for r in rects] + [min(l[0], l[2]) - l[4] - abs(l[8]) for l in lines]
+               + [d[0] - d[2] for d in dots])
+        xs1 = ([r[2] + r[7] for r in rects] + [max(l[0], l[2]) + l[4] + abs(l[8]) for l in lines]
+               + [d[0] + d[2] for d in dots])
+        ys0 = ([r[1] - r[8] for r in rects] + [min(l[1], l[3]) - l[4] - abs(l[9]) for l in lines]
+               + [d[1] - d[2] for d in dots])
+        ys1 = ([r[3] + r[8] for r in rects] + [max(l[1], l[3]) + l[4] + abs(l[9]) for l in lines]
+               + [d[1] + d[2] for d in dots])
+        bx0 = max(0, int(math.floor(min(xs0) - margin)) // q * q)
+        by0 = max(0, int(math.floor(min(ys0) - margin)) // q * q)
+        bx1 = min(self.W, -(-int(math.ceil(max(xs1) + margin)) // q) * q)
+        by1 = min(self.H, -(-int(math.ceil(max(ys1) + margin)) // q) * q)
+        if bx1 <= bx0 or by1 <= by0:
+            return None
+        box = (bx0, by0, bx1, by1)
+        rgb, alpha = self._composite(sc, rects, lines, dots, box, sig_in, sig_out)
+        return box, rgb, alpha
 
-        if rects or lines or dots:
-            sig_in = GLOW_SIGMA_IN * sc.zoom * s
-            sig_out = GLOW_SIGMA_OUT * sc.zoom * s
-            margin = 3.2 * sig_out + 4
-            xs0 = ([r[0] - r[7] for r in rects] + [min(l[0], l[2]) - l[4] - abs(l[8]) for l in lines]
-                   + [d[0] - d[2] for d in dots])
-            xs1 = ([r[2] + r[7] for r in rects] + [max(l[0], l[2]) + l[4] + abs(l[8]) for l in lines]
-                   + [d[0] + d[2] for d in dots])
-            ys0 = ([r[1] - r[8] for r in rects] + [min(l[1], l[3]) - l[4] - abs(l[9]) for l in lines]
-                   + [d[1] - d[2] for d in dots])
-            ys1 = ([r[3] + r[8] for r in rects] + [max(l[1], l[3]) + l[4] + abs(l[9]) for l in lines]
-                   + [d[1] + d[2] for d in dots])
-            bx0 = max(0, int(math.floor(min(xs0) - margin)) // q * q)
-            by0 = max(0, int(math.floor(min(ys0) - margin)) // q * q)
-            bx1 = min(self.W, -(-int(math.ceil(max(xs1) + margin)) // q) * q)
-            by1 = min(self.H, -(-int(math.ceil(max(ys1) + margin)) // q) * q)
-            if bx1 > bx0 and by1 > by0:
-                self._composite(frame, sc, rects, lines, dots, (bx0, by0, bx1, by1), sig_in, sig_out)
-
-        if texts:
-            self.draw_texts(frame, sc)
-        return frame
-
-    def draw_texts(self, frame, sc):
-        for kind, txt, op in sc.texts:
-            self.text.draw(frame, kind, txt, op)
-
-    def render_blurred(self, scenes, bounds, text_scene):
+    def layers_blurred(self, scenes, bounds):
         """Motion blur over the shutter interval. scenes[k] is the scene at the centre of
         sub-interval k and bounds[k], bounds[k+1] the scenes at its ends: each rect (and each
         axis-aligned line) of scenes[k] is box-blurred along its own displacement over the
-        sub-interval, so the sub-frames tile the motion without ripple. Sub-frames are
-        averaged in linear light; the text of `text_scene` is drawn once on top."""
+        sub-interval, so the sub-frames tile the motion without ripple. Batches with a fixed
+        smear (motion trails) keep theirs. Returns the sub-frame layers for compose()."""
         for k, sc in enumerate(scenes):
             A, B = bounds[k], bounds[k + 1]
             for bc, ba, bb in zip(sc.rects, A.rects, B.rects):
+                if bc.get("fixed"):
+                    continue
                 if len(ba["x"]) == len(bb["x"]) == len(bc["x"]):
                     bc["sx"], bc["sy"] = bb["x"] - ba["x"], bb["y"] - ba["y"]
             if len(A.lines) == len(B.lines) == len(sc.lines):
                 sc.line_smear = [(0.5 * (lb[0] - la[0] + lb[2] - la[2]), 0.5 * (lb[1] - la[1] + lb[3] - la[3]))
                                  for la, lb in zip(A.lines, B.lines)]
-        if len(scenes) == 1:
-            frame = self.render(scenes[0], texts=False)
-            self.draw_texts(frame, text_scene)
+        return [self.layer(sc) for sc in scenes]
+
+    def compose(self, frame, layers):
+        """Average the data layers (sub-frames; None = nothing drawn in that one) in linear
+        light and composite them over the background frame (uint8, modified in place):
+        out = data + background * (1 - alpha)."""
+        count = len(layers)
+        layers = [L for L in layers if L is not None]
+        if not layers:
             return frame
-        acc = np.zeros((self.H, self.W, 3), np.float32)
-        r0, r1 = self.H, 0
-        for sc in scenes:
-            f = self.render(sc, texts=False)
-            rows = np.flatnonzero(f.reshape(self.H, -1).any(1))
-            if rows.size:
-                a, b = int(rows[0]), int(rows[-1]) + 1
-                acc[a:b] += SRGB_TO_LIN[f[a:b]]
-                r0, r1 = min(r0, a), max(r1, b)
-        frame = np.zeros((self.H, self.W, 3), np.uint8)
-        if r1 > r0:
-            lin = acc[r0:r1] * (1.0 / len(scenes))
-            idx = (np.clip(lin, 0.0, 1.0) * (_LIN_N - 1) + 0.5).astype(np.int32)
-            frame[r0:r1] = LIN_TO_SRGB[idx]
-        self.draw_texts(frame, text_scene)
+        x0 = min(L[0][0] for L in layers)
+        y0 = min(L[0][1] for L in layers)
+        x1 = max(L[0][2] for L in layers)
+        y1 = max(L[0][3] for L in layers)
+        acc = np.zeros((y1 - y0, x1 - x0, 3), np.float32)
+        aacc = np.zeros((y1 - y0, x1 - x0), np.float32)
+        for (bx0, by0, bx1, by1), rgb, alpha in layers:
+            idx = (rgb * 255.0 + 0.5).astype(np.uint8)
+            acc[by0 - y0:by1 - y0, bx0 - x0:bx1 - x0] += SRGB_TO_LIN[idx]
+            aacc[by0 - y0:by1 - y0, bx0 - x0:bx1 - x0] += alpha
+        if count > 1:
+            acc *= 1.0 / count
+            aacc *= 1.0 / count
+        bg = SRGB_TO_LIN[frame[y0:y1, x0:x1]]
+        bg *= (1.0 - np.clip(aacc, 0.0, 1.0))[..., None]
+        acc += bg
+        idx = (np.clip(acc, 0.0, 1.0) * (_LIN_N - 1) + 0.5).astype(np.int32)
+        frame[y0:y1, x0:x1] = LIN_TO_SRGB[idx]
         return frame
 
-    def _composite(self, frame, sc, rects, lines, dots, box, sig_in, sig_out):
+    def _composite(self, sc, rects, lines, dots, box, sig_in, sig_out):
         q = self.q
         bx0, by0, bx1, by1 = box
         bw, bh = bx1 - bx0, by1 - by0
@@ -531,14 +556,25 @@ class Raster:
         g = np.zeros((gh, gw, 3), np.float32)
         gx0, gy0 = bx0 / q - pad, by0 / q - pad        # glow-buffer origin in q-pixels
 
-        for x0, y0, x1, y1, col, lv, gl, hx, hy in rects:
+        for x0, y0, x1, y1, col, lv, gl, hx, hy, trail in rects:
             c = _box_cov(x0 - bx0, y0 - by0, x1 - bx0, y1 - by0, bw, bh, hx, hy)
+            body = col * lv
+            m = float(body.max())
+            if lv > 1.0:          # brightness lifts above the nominal colour: soft, hue-kept cap
+                kn = min(max(BODY_KNEE, float(col.max())), 0.999)
+                if m > kn:
+                    body = body * ((kn + (1 - kn) * (1 - math.exp(-(m - kn) / (1 - kn)))) / m)
             if c is not None:
                 i0, i1, j0, j1, cov = c
                 a = cov * min(lv, 1.0)
+                if trail:      # afterimages: max-blended, so overlapping trails never pile up
+                    reg = rgb[j0:j1, i0:i1]
+                    np.maximum(reg, cov[..., None] * body.astype(np.float32), out=reg)
+                    np.maximum(alpha[j0:j1, i0:i1], a, out=alpha[j0:j1, i0:i1])
+                    continue
                 reg = rgb[j0:j1, i0:i1]
                 reg *= (1.0 - a)[..., None]
-                reg += (cov * lv)[..., None] * col.astype(np.float32)
+                reg += cov[..., None] * body.astype(np.float32)
                 alpha[j0:j1, i0:i1] += (1.0 - alpha[j0:j1, i0:i1]) * a
             if gl > 0:
                 c = _box_cov(x0 / q - gx0, y0 / q - gy0, x1 / q - gx0, y1 / q - gy0, gw, gh, hx / q, hy / q)
@@ -592,9 +628,7 @@ class Raster:
         up *= (1.0 - alpha)[..., None]
         rgb += up
         np.clip(rgb, 0.0, 1.0, out=rgb)
-        rgb *= 255.0
-        rgb += 0.5
-        frame[by0:by1, bx0:bx1] = rgb.astype(np.uint8)
+        return rgb, np.clip(alpha, 0.0, 1.0)
 
     @staticmethod
     def _line(rgb, alpha, g, seg, wd, col, al, w, h, additive, hx=0.0, hy=0.0):
