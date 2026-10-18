@@ -61,7 +61,7 @@ SHOTS = [
          chunks=["回到村子。", "这一次，有一个人，开始去听远处的颜色。"]),
     dict(id="S19", ch=6, base=4.5, lead=0.3, gap=0.35, tail=0.7,
          chunks=["它走到了中间。", "它听得见两边，两边也还听得见它。"]),
-    dict(id="S20", ch=6, base=5.0, lead=0.3, gap=0.85, tail=1.6,
+    dict(id="S20", ch=6, base=5.0, lead=0.3, gap=0.85, tail=1.5,
          chunks=["很久，几乎什么也没发生。", "然后，裂缝合上了。"]),
     dict(id="S21", ch=6, base=5.0, lead=0.3, gap=0.4, tail=0.8,
          chunks=["这并不总能成功。", "两边离得太远，就没有人能同时被两边听见。"]),
@@ -73,7 +73,7 @@ SHOTS = [
 # uses shot-relative seconds, where end may be None (= shot end) and the special
 # strings "c1s"/"c1e"/... name chunk starts/ends. "{r}" is a live round counter.
 ANNOTATIONS = {
-    "S01": "N = 1",
+    "S01": [("N = 1", "rect_in+0.35", None)],
     "S02": "N = 100 · OPINION x ∈ [0, 1]",
     "S03": "INITIAL STATE · EVENLY SPACED · x = 0.00 … 1.00",
     "S04": "ONE RULE · BOUNDED CONFIDENCE",
@@ -93,8 +93,8 @@ ANNOTATIONS = {
     "S17": "ILLUSTRATIVE · A MODEL, NOT A MEASUREMENT",
     "S18": "1 AGENT · ε : 0.20 → 0.40 · EVERYONE ELSE UNCHANGED",
     "S19": [("ROUND 1 · BRIDGE x = 0.50 · DISTANCE 0.19 ≤ ε, BOTH SIDES", "round:1+0.3", None)],
-    "S20": [("ROUND {r} · BRIDGE ε = 0.40 · OTHERS ε = 0.20", 0.0, "merge1"),
-            ("MERGED AT ROUND 36 · THE SPLIT SETTLED AT ROUND 7", "merge1", None)],
+    "S20": [("ROUND {r} · BRIDGE ε = 0.40 · OTHERS ε = 0.20", 0.0, "merge"),
+            ("MERGED AT ROUND 36 · THE SPLIT SETTLED AT ROUND 7", "merge", None)],
     "S21": "REQUIRES GAP ≤ 2ε · HERE 0.39 ≤ 0.40",
     "S22": [("ε = ?", 0.5, "c1e+0.2"),
             ("Hegselmann & Krause, JASSS 5(3), 2002 · SIMULATION: N = 100, EVENLY SPACED START",
@@ -173,13 +173,13 @@ def shot_events(sid, d, c):
     if sid == "S06":
         return {"rays": [cs(1) + 0.35, cs(1) + 1.45], "move": [cs(1) + 1.5, cs(1) + 3.0]}
     if sid == "S07":
-        return {"zoom_out": [0.0, 1.1], "reset_demo": [0.0, 0.9], "flash": [1.0, 1.5],
-                "round:1": [1.55, 2.4], "round:2": [cs(2) + 0.45, cs(2) + 1.25],
+        return {"reset_demo": [0.0, 0.55], "zoom_out": [0.45, 1.3], "flash": [1.25, 1.7],
+                "round:1": [1.7, 2.5], "round:2": [cs(2) + 0.45, cs(2) + 1.25],
                 "rewind": [d - 1.3, d - 0.15]}
     if sid == "S08":
         return {"sweep": [0.0, 0.75], "bracket_in": [0.2, 0.9], "bracket_out": [d - 0.55, d - 0.1]}
     if sid == "S09":
-        return rounds(1, 3, 0.3, d - 0.15, frac=0.8)
+        return rounds(1, 3, 0.3, d - 0.15, frac=0.72)
     if sid == "S10":
         return {"round:4": [0.0, 0.85], "glow": [0.85, 1.7], "accent": [0.85, 2.3]}
     if sid == "S11":
@@ -220,10 +220,16 @@ def shot_events(sid, d, c):
         ev["merge"] = [cs(2) + 0.2 + MERGE_CONTACT * 0.75] * 2
         return ev
     if sid == "S21":
+        # dim: the real block shrinks, sinks and dims (stage for the inset); the inset shows the
+        # real bridge-round-1 geometry, opens each block's listening bracket, then (hypothetically)
+        # the blocks drift apart: strain until the brackets stop overlapping at the bridge, break,
+        # release; undim brings the real block back for S22
         dur2 = ce(2) - cs(2)
-        b = cs(2) + 0.55 * dur2
-        return {"dim": [0.15, 0.6], "diagram_in": [cs(1) + 0.45, cs(1) + 1.0],
-                "break": [b, b + 0.3], "diagram_out": [d - 1.0, d - 0.45], "undim": [d - 0.7, d - 0.1]}
+        b = cs(2) + 0.42 * dur2
+        return {"dim": [0.0, 0.75], "diagram_in": [cs(1) + 0.25, cs(1) + 0.8],
+                "bracket_l": [cs(1) + 0.85, cs(1) + 1.35], "bracket_r": [cs(1) + 1.15, cs(1) + 1.65],
+                "strain": [b - 1.1, b], "break": [b, b + 0.3], "release": [b, b + 1.25],
+                "diagram_out": [d - 0.95, d - 0.4], "undim": [d - 0.8, d - 0.05]}
     if sid == "S22":
         e = ce(1)
         # the question holds to the end; the background recedes first, then card, citation and

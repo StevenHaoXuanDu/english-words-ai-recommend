@@ -186,12 +186,12 @@ class Ag:
         return Ag(A.op + (B.op - A.op) * e, A.wx + (B.wx - A.wx) * e, A.wy + (B.wy - A.wy) * e)
 
     @staticmethod
-    def tween(A, B, p):
+    def tween(A, B, p, ex_fn=None):
         """Round tween at linear progress p: opinion/x/colour land over the first 68 % of the
         window (ease_snap: quick take-off, long soft landing, no overshoot), y (stacking) over
         the last half, so converging rects meet side by side and only then stack (a
         simultaneous x/y lerp draws diagonal '/' bars mid-tween)."""
-        ex, ey = ease_snap(p / 0.68), ease_land((p - 0.5) / 0.5)
+        ex, ey = (ex_fn or ease_snap)(p / 0.68), ease_land((p - 0.5) / 0.5)
         return Ag(A.op + (B.op - A.op) * ex, A.wx + (B.wx - A.wx) * ex, A.wy + (B.wy - A.wy) * ey)
 
     def colours(self):
@@ -651,13 +651,15 @@ def s08(sh, t, sc):
             snap=settle(pin, head=False))
 
 
-def _rounds(seq, sh, t):
+def _rounds(seq, sh, t, ex_fn=None):
     k0, k1, p = round_pos(t, sh["events"])
-    return Ag.tween(seq[k0], seq[k1], p)
+    return Ag.tween(seq[k0], seq[k1], p, ex_fn)
 
 
 def s09(sh, t, sc):
-    _rounds(WIDE, sh, t).emit(sc, CAM1)
+    # in-out easing: each round's contraction keeps moving through most of its slot instead of
+    # landing early and leaving a still gap before the next round
+    _rounds(WIDE, sh, t, ease).emit(sc, CAM1)
 
 
 def rise_glint(a, t, on, period=1.7, amp=1.0, sigma=26.0):
@@ -785,9 +787,38 @@ def s13(sh, t, sc):
     dip = 0.22 * min(1.0, u / 0.12) * (1 - smooth((u - 0.12) / 0.9)) if u > 0 else 0.0
     a.level = a.level * (1 - dip)
     a.glow = a.glow * (1 - 1.6 * dip)
+    ff_scans(sc, a, t, E["fast_forward"])
     a.emit(sc, CAM1)
     sc.glow_gain = 1.0 + 0.04 * math.sin(2 * math.pi * (t - sh["start"]) / 3.0)
     gap_measure(sc, t, E["measure"], NSEQ[-1])
+
+
+FF_SCANS, FF_RATIO, FF_DUR = 4, 0.75, 0.6
+
+
+def ff_scans(sc, a, t, win):
+    """S13 fast-forward: rounds keep coming (the counter runs on to 100) but nothing moves.
+    FF_SCANS faint scanlines pass down through both blocks, each sooner after the last; only
+    level and glow change. Slower and fainter than a real round's pulse."""
+    f0, f1 = win
+    w = [FF_RATIO ** j for j in range(FF_SCANS)]
+    span = (f1 - f0) - FF_DUR
+    top, bot = float(a.wy.min()) - 40.0, float(a.wy.max()) + 40.0
+    for j in range(FF_SCANS):
+        ts = f0 + span * sum(w[:j]) / sum(w[:-1])
+        u = (t - ts) / FF_DUR
+        if not (0.0 < u < 1.0):
+            continue
+        y = top + (bot - top) * smooth(u)
+        env = bump(u)
+        g = np.exp(-0.5 * ((a.wy - y) / 20.0) ** 2) * env
+        a.level = a.level * (1 + 0.14 * g)
+        a.glow = a.glow * (1 + 0.6 * g)
+        xs_ = np.sort(a.wx)
+        cuts = np.flatnonzero(np.diff(xs_) > 40.0)
+        for lo, hi in zip(np.r_[0, cuts + 1], np.r_[cuts, len(xs_) - 1]):
+            sc.fx.append(dict(type="scan", y=y, x0=float(xs_[lo]) - 10.0, x1=float(xs_[hi]) + 10.0,
+                              amp=0.06 * env))
 
 
 def gap_measure(sc, t, win, L, y=None):
@@ -1001,7 +1032,9 @@ def s18(sh, t, sc):
         new.level[:] = 1.0 if done else 0.0
     else:
         sc.fx.append(f)
-        old.level = smooth_a((old.wx - bx) / 50.0 + 0.5)
+        # the old fracture darkens well ahead of the beam (and overall as the wipe runs), so
+        # old and new rects never stand side by side at the beam as if they were one state
+        old.level = smooth_a((old.wx - bx - 30.0) / 280.0) * (1 - 0.5 * prog(t, E["reset"]))
         new.level = smooth_a((bx - new.wx) / 50.0 + 0.5)
         g = np.exp(-0.5 * ((new.wx - bx) / 70.0) ** 2)
         new.level = new.level * (1 + 0.2 * g)
@@ -1097,42 +1130,105 @@ def s20(sh, t, sc):
             sc.fx.append(f)
 
 
-DIAGRAM_SCALE, DIAGRAM_CY = 0.45, 245.0      # S21 schematic: scaled copy of the bridge-round-1 layout
+class CamY(Cam):
+    """Cam with a vertical offset: S21 sinks the real block to give the inset its own stage."""
+
+    def __init__(self, z=1.0, cx=960.0, dy=0.0):
+        super().__init__(z, cx)
+        self.dy = float(dy)
+
+    def y(self, wy):
+        return (np.asarray(wy) - Y0) * self.z + Y0 + self.dy
 
 
-def _diagram(sc, t, E):
+STAGE_Z, STAGE_DY = 0.62, 150.0          # S21: the merged block while the inset is up
+STAGE_LEVEL = 0.32                        # ... dimmed to this,
+AMBER = np.array([0.88, 0.58, 0.28])      # ... and warmed toward dark amber (not olive)
+INSET_K, INSET_CY = 0.72, 300.0           # inset: scale of the bridge-round-1 layout, centre y
+INSET_HALF_W = 620.0                      # inset frame half width (holds the released state)
+INSET_D_END = 0.30                        # hypothetical bridge-to-block distance after release
+INSET_TAG = "IF THE GAP > 2ε"
+
+
+def _inset_d(t, E, d0, eps):
+    """Bridge-to-block distance in the inset: the real round-1 value, then (hypothetically)
+    drifting apart - slowly, accelerating, until it reaches eps exactly at the break (the
+    brackets stop overlapping at the bridge), then released quickly to INSET_D_END."""
+    s0, s1 = E["strain"]
+    if t < s0:
+        return d0
+    if t < s1:
+        u = prog(t, (s0, s1))
+        return d0 + (eps - d0) * u * u
+    return eps + (INSET_D_END - eps) * ease_out(prog(t, E["release"]))
+
+
+def _inset(sc, t, E):
     o = smooth(prog(t, E["diagram_in"])) * (1 - smooth(prog(t, E["diagram_out"])))
     if o <= 1e-3:
         return
-    eps_o = 0.20                                   # everyone but the bridge
+    eps = 0.20                                     # everyone but the bridge
     base = BRIDGE[1]                               # bridge at 0.50, blocks at 0.31 / 0.69
     d0 = base.op[BRIDGE_I] - base.op[0]            # bridge-to-block distance (0.19)
-    b0, b1 = E["break"]
-    i1 = E["diagram_in"][1]
-    pa = prog(t, (i1 + 0.2, b0))
-    d = d0 + (eps_o - d0) * pa * pa                # creep up to the limit eps, then past it
-    d += (0.27 - eps_o) * ease_out(prog(t, (b0, b1 + 0.6)))
-    k = DIAGRAM_SCALE
+    d = _inset_d(t, E, d0, eps)
+    k = INSET_K
+    b0 = E["break"][0]
+    broken = t >= b0
     shift = (d - d0) * 1600.0 * k
     xs = (base.wx - X(base.op[BRIDGE_I])) * k + 960.0
-    ys = (base.wy - Y0) * k + DIAGRAM_CY
+    ys = (base.wy - Y0) * k + INSET_CY
     xs = np.where(LEFT, xs - shift, np.where(RIGHT, xs + shift, xs))
-    lv = np.full(N, 0.9 * o)
+    strain = prog(t, E["strain"]) if not broken else 0.0
+    lonely = smooth(prog(t, (b0, b0 + 0.9)))
+    lv = np.full(N, 0.92 * o)
     gl = np.ones(N)
     rgb = opinion_rgb(base.op)
     rgb[BRIDGE_I] = WHITE_GOLD
-    lv[BRIDGE_I], gl[BRIDGE_I] = o, 1.6
-    tension = smooth(pa) if t < b0 else 0.0        # the threads tighten as the gap nears 2 eps
-    gl[BRIDGE_I] *= 1 + 0.5 * tension
+    lv[BRIDGE_I] = o * (1 - 0.18 * lonely)
+    gl[BRIDGE_I] = 1.6 * (1 + 0.6 * strain * strain) * (1 - 0.35 * lonely)
     sc.add_rects(xs, ys, RECT_W * k, RECT_H * k, rgb, lv, gl, life=True)
+
+    bx, cy = float(xs[BRIDGE_I]), float(ys[BRIDGE_I])
+    hw = RECT_W * k / 2
+    top = float(ys.min()) - RECT_H * k / 2 - 16.0
+    bot = float(ys.max()) + RECT_H * k / 2 + 16.0
+
+    # frame: four hairline corners and the hypothesis tag, so the inset reads as a "what if"
+    fl, fr, ft, fb = 960.0 - INSET_HALF_W, 960.0 + INSET_HALF_W, top - 30.0, bot + 22.0
+    arm = 22.0
+    for x_, sx in ((fl, 1), (fr, -1)):
+        for y_, sy in ((ft, 1), (fb, -1)):
+            sc.line(x_, y_, x_ + sx * arm, y_, 1.0, GOLD, 0.32 * o, 0.3)
+            sc.line(x_, y_, x_, y_ + sy * arm, 1.0, GOLD, 0.32 * o, 0.3)
+    sc.labels.append((INSET_TAG, 960.0, ft, 0.62 * o, 14))
+
+    # each block's listening bracket (centred on the block, +-eps): the bridge is heard while it
+    # sits where the two brackets overlap; the inner edges converge on it under strain and cross
+    # it at the break
+    reach = eps * 1600.0 * k
+    for side, mask, win in ((-1, LEFT, E["bracket_l"]), (1, RIGHT, E["bracket_r"])):
+        po = prog(t, win)
+        if po <= 0:
+            continue
+        xc_ = float(xs[mask].mean())
+        col = 0.5 * opinion_rgb(np.array([base.op[mask].mean()]))[0] + 0.5 * np.asarray(GOLD)
+        half = reach * ease_out(po)
+        ab = (0.55 + 0.25 * strain) * o * smooth(po * 3)
+        for xe, inward in ((xc_ - half, 1), (xc_ + half, -1)):
+            sc.line(xe, top, xe, bot, 1.0, col, ab, 0.45)
+            sc.line(xe, top, xe + inward * 8.0, top, 1.0, col, ab, 0.45)
+
+    # threads from the facing block edges to the bridge: tighten (brighter, thinner, a nervous
+    # shimmer at the end) under strain, snap at the break and recoil
     gap = 3.0
-    bx, cy = xs[BRIDGE_I], ys[BRIDGE_I]
     pulses_x, pulses_a = [], []
-    for side, (a_x, b_x) in ((-1, (xs[LEFT].max() + RECT_W * k / 2 + gap, bx - RECT_W * k / 2 - gap)),
-                             (1, (xs[RIGHT].min() - RECT_W * k / 2 - gap, bx + RECT_W * k / 2 + gap))):
-        if t < b0:
-            sc.line(a_x, cy, b_x, cy, 1.0, GOLD, (0.5 + 0.3 * tension) * o, 0.5 + 0.4 * tension)
-            # light pulses along the thread, alternating out / in (as in S19), until it snaps
+    i1 = E["diagram_in"][1]
+    for a_x, b_x in ((float(xs[LEFT].max()) + hw + gap, bx - hw - gap),
+                     (float(xs[RIGHT].min()) - hw - gap, bx + hw + gap)):
+        if not broken:
+            jit = 0.12 * strain ** 3 * math.sin(2 * math.pi * 11.0 * t)
+            sc.line(a_x, cy, b_x, cy, 1.0 - 0.3 * strain, GOLD,
+                    (0.5 + 0.4 * strain + jit) * o, 0.5 + 0.7 * strain)
             n = int((t - i1) / 0.5)
             for j in range(max(0, n - 1), n + 1):
                 u = (t - i1 - j * 0.5) / 0.45
@@ -1141,36 +1237,31 @@ def _diagram(sc, t, E):
                     pulses_x.append(p0 + (p1 - p0) * smooth(u))
                     pulses_a.append(0.38 * o * math.sin(math.pi * u) ** 0.7)
         else:                                      # snap: halves recoil to their ends and fade
-            u = ease_out(prog(t, (b0, b1 + 0.15)))
+            u = ease_out(prog(t, (b0, b0 + 0.45)))
             mid = (a_x + b_x) / 2
-            al = 0.6 * o * (1 - smooth(prog(t, (b0, b1 + 0.25))))
-            sc.line(a_x, cy, a_x + (mid - a_x) * (1 - u), cy, 1.0, GOLD, al, 0.5)
-            sc.line(b_x, cy, b_x + (mid - b_x) * (1 - u), cy, 1.0, GOLD, al, 0.5)
+            al = 0.7 * o * (1 - smooth(prog(t, (b0, b0 + 0.55))))
+            sc.line(a_x, cy, a_x + (mid - a_x) * (1 - u), cy, 1.0, GOLD, al, 0.6)
+            sc.line(b_x, cy, b_x + (mid - b_x) * (1 - u), cy, 1.0, GOLD, al, 0.6)
     if pulses_x:
         sc.fx.append(dict(type="pulses", y=cy, xs=pulses_x, amps=pulses_a, sigma=3.0))
-    # reach measure under the diagram: bridge-to-cluster distance lines stretch outward; the
-    # fixed ticks mark eps = 0.20 (everyone but the bridge); the threads snap as they pass it
-    ym = ys.min() - RECT_H * k / 2 - 16.0          # above the schematic, clear of the row below
-    reach = eps_o * 1600.0 * k
-    om = o * (1 - smooth(prog(t, (b1, b1 + 0.6))))
-    if om > 1e-3:
-        for side, xc_ in ((-1, xs[LEFT].mean()), (1, xs[RIGHT].mean())):
-            sc.line(bx, ym, xc_, ym, 1.0, GOLD, 0.40 * om, 0.3)
-            sc.line(xc_, ym - 4.0, xc_, ym + 4.0, 1.0, GOLD, 0.45 * om, 0.3)
-            xr = bx + side * reach
-            sc.line(xr, ym - 7.0, xr, ym + 7.0, 1.0, GOLD, (0.5 + 0.3 * tension) * om, 0.4)
-            sc.labels.append(("ε", xr, ym - 13.0, 0.5 * om, 13))
-        sc.line(bx, ym - 5.0, bx, ym + 5.0, 1.0, GOLD, 0.45 * om, 0.3)
+    for f in (M.burst(t, b0, bx, cy, n=18, seed=21, half=(3.0, 6.0), amp=0.5 * o,
+                      speed=(70.0, 190.0), dur=0.8),
+              M.ripple(t, b0, bx, cy, 70.0, dur=0.8, amp=0.2 * o, ratio=0.6, w=1.6)):
+        if f:
+            sc.fx.append(f)
 
 
 def s21(sh, t, sc):
     E = sh["events"]
+    st = smooth(prog(t, E["dim"])) * (1 - smooth(prog(t, E["undim"])))
+    cam = CamY(1.0 + (STAGE_Z - 1.0) * st, 960.0, STAGE_DY * st)
     a = Ag.of(BRIDGE[MERGE_ROUND])
     _bridge_look(a)
-    a.level[:] = 1 - 0.6 * smooth(prog(t, E["dim"])) + 0.6 * smooth(prog(t, E["undim"]))
-    a.emit(sc, CAM1)
-    sc.axis_level = a.level[0]
-    _diagram(sc, t, E)
+    a.rgb = a.colours() + (AMBER - a.colours()) * (0.45 * st)
+    a.level = a.level * (1 - (1 - STAGE_LEVEL) * st)
+    a.emit(sc, cam)
+    sc.axis_level = 1 - st
+    _inset(sc, t, E)
 
 
 CARD_MIN_LEAD = 0.35     # s: shortest time the rects under the S22 card get to go dark
@@ -1275,7 +1366,14 @@ CHAPTERS = {1: ("01 · 村子", "THE VILLAGE"), 2: ("02 · 规则", "THE RULE"),
             4: ("04 · 实验二：窄信任", "EXPERIMENT 2 · NARROW ε"),
             5: ("05 · 现实", "THE REAL WORLD"), 6: ("06 · 桥", "THE BRIDGE")}
 CHAPTER_DELAY = {1: 0.45, 2: 0.35, 3: 0.2, 4: 0.25, 5: 0.75, 6: 0.85}   # after the transition
-CHAPTER_LEN = 2.1
+CHAPTER_LEN = 2.1        # minimum; longer labels stay up longer (chapter_len)
+
+
+def chapter_len(serif):
+    """Overlay time of a chapter label: its glyph reveal (render_text.chapter: 0.08 s + 0.045 s
+    stagger + 0.32 s per glyph), then at least 0.45 s + len/8 s fully legible, then the exit."""
+    n = len(serif)
+    return max(CHAPTER_LEN, 0.08 + 0.045 * (n - 1) + 0.32 + 0.45 + n / 8.0 + 0.4)
 CAP_PRE, CAP_POST, CAP_SEP = 0.2, 0.35, 0.05   # caption shown this much before / after its slot
 
 
@@ -1356,7 +1454,7 @@ class Show:
             if ch not in seen:
                 seen.add(ch)
                 a = sh["start"] + CHAPTER_DELAY.get(ch, 0.3)
-                self.chapters.append((a, a + CHAPTER_LEN, CHAPTERS[ch]))
+                self.chapters.append((a, a + chapter_len(CHAPTERS[ch][0]), CHAPTERS[ch]))
         B = self.by_id
         REF["S05_listen"] = B["S05"]["events"]["bracket_in"][1] + 0.4
         REF["S15_listen"] = B["S15"]["events"]["bracket_in"][1] + 0.15
@@ -1372,8 +1470,8 @@ class Show:
         return self.shots[-1]
 
     def annotation_text(self, a, sh, t):
-        """{r} is a live round counter, right-aligned in a fixed-width field (padded with
-        spaces) so the centred annotation never shifts when the counter gains a digit."""
+        """{r} is a live round counter in a fixed-width field so the centred annotation never
+        shifts: zero-padded to three digits like the HUD (ROUND 007) once it can reach 10."""
         txt = a["text"]
         c = a.get("counter")
         if "{r}" not in txt or not c:
@@ -1388,7 +1486,8 @@ class Show:
         else:
             r = self.counter_value(c, t)
             widest = max(c["from"], c["to"])
-        return txt.replace("{r}", str(r).rjust(len(str(widest))))
+        width = 3 if widest >= 10 else len(str(widest))
+        return txt.replace("{r}", f"{r:0{width}d}")
 
     @staticmethod
     def counter_value(c, t):
