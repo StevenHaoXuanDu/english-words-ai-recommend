@@ -17,9 +17,12 @@ sys.path.insert(0, os.path.dirname(HERE))
 import hk_sim  # noqa: E402
 
 import render_motion as M  # noqa: E402
+import timeline as TL  # noqa: E402
 from render_core import (GOLD, RECT_H, RECT_W, WHITE_GOLD, Y0, ROW_L, ROW_R,  # noqa: E402
                          Layout, Scene, X, card_box, layout_seq, opinion_rgb)
 from render_fx import AXIS_DY, AXIS_Y_PARALLAX  # noqa: E402
+
+AXIS_CLEAR = 30.0     # design px (x zoom) the axis keeps below the lowest rect of its camera
 
 N = hk_sim.N
 X0 = np.asarray(hk_sim.X0, dtype=np.float64)
@@ -330,7 +333,7 @@ LISTEN_PERIOD, LISTEN_SIGMA = 1.6, 0.022
 REF = {}      # absolute start times of effects that run across a cut (set by Show)
 
 
-def listen(a, xc, eps, t, on, off=None, amp=1.0):
+def listen(a, xc, eps, t, on, off=None, amp=1.0, period=None):
     """'Listening' wave: soft light runs out from the listener at opinion xc to the edges of
     its bracket, over the members only, every LISTEN_PERIOD s (level and glow only). It
     runs from `on`, fading in, and fades out before `off`."""
@@ -339,7 +342,7 @@ def listen(a, xc, eps, t, on, off=None, amp=1.0):
     k = smooth((t - on) / 0.4) * (1.0 if off is None else 1 - smooth((t - off + 0.4) / 0.4))
     if k <= 1e-3:
         return
-    u = ((t - on) / LISTEN_PERIOD) % 1.0
+    u = ((t - on) / (period or LISTEN_PERIOD)) % 1.0
     d = np.abs(a.op - xc)
     g = np.exp(-0.5 * ((d - eps * u) / LISTEN_SIGMA) ** 2) * inside(a.op, xc, eps) * (1 - u) ** 0.6
     g *= k * amp
@@ -376,15 +379,29 @@ def thread_pulses(sc, cam, a, t, t_on, alpha):
 
 
 # ----------------------------------------------------------------------------- shots
+AXIS_SEED = 0.05      # S01: the axis starts as a short hairline under the single rect
+
+
 def s01(sh, t, sc):
+    """One rect lights up; the background drifts in (its camera pulls back from 1.24 to 1, the
+    dust depths part at their parallax and land at rest on the cut), a soft bloom opens
+    around the rect and the axis is seeded."""
     E = sh["events"]
-    sc.bg_level = smooth((t - sh["start"]) / 1.8)
-    sc.axis_draw = 0.0
+    sc.bg_level = smooth((t - sh["start"]) / 1.3)
+    zb = 1.0 + 0.24 * (1 - ease_out(prog(t, (sh["start"], sh["end"]))))
+    sc.cam = (zb, 960.0)
+    sc.axis_cam = CAM1
+    sc.axis_draw = AXIS_SEED * ease_land(prog(t, (E["rect_in"][0] + 0.35, sh["end"])))
     a = Ag.of(INIT)
     a.level[:] = 0.0
     a.level[50] = smooth(prog(t, E["rect_in"]))
     a.glow[50] = 1.0 + 0.22 * math.sin(2 * math.pi * (t - sh["start"]) / 3.0)
     a.emit(sc, CAM1)
+    # a soft bloom of light opens around the first rect as it appears
+    f = M.glow(t, E["rect_in"][0] + 0.25, float(INIT.wx[50]), Y0, 260.0, 150.0, dur=1.5, amp=0.06,
+               attack=0.5)
+    if f:
+        sc.fx.append(f)
 
 
 def s02(sh, t, sc):
@@ -396,7 +413,7 @@ def s02(sh, t, sc):
     a.level = smooth_a((t - start) / fade)
     a.level[50] = 1.0
     a.emit(sc, CAM1)
-    sc.axis_draw = ease_land(prog(t, (t0 + 0.15, t1 + 0.2)))
+    sc.axis_draw = AXIS_SEED + (1 - AXIS_SEED) * ease_land(prog(t, (t0 + 0.15, t1 + 0.2)))
 
 
 S03_ZOOM, S03_RAMP, S03_FROM, S03_TO = 0.5, 0.4, 0.36, 0.64
@@ -438,12 +455,26 @@ def s03(sh, t, sc):
     sc.cam = (cam.z, cam.cx)
 
 
+S04_PUSH = 0.05      # S04: a slow push in on the row under the card; S05's zoom starts from it
+
+
+def s04_cam(sh, t):
+    return Cam(1.0 + S04_PUSH * ease_sine(prog(t, (sh["start"], sh["end"]))), 960.0)
+
+
 def s04(sh, t, sc):
+    """The row dims to half under the card and keeps living: a wave of light runs out from the
+    middle of the row to both ends (the rule, played on everyone) while the camera pushes in."""
     E = sh["events"]
+    cam = s04_cam(sh, t)
     a = Ag.of(INIT)
-    a.level[:] = 1 - 0.7 * smooth(prog(t, E["dim"])) + 0.7 * smooth(prog(t, E["undim"]))
-    a.emit(sc, CAM1)
-    sc.axis_level = a.level[0]
+    a.level[:] = 1 - 0.5 * smooth(prog(t, E["dim"])) + 0.5 * smooth(prog(t, E["undim"]))
+    lvl = a.level[0]
+    listen(a, X0[50], 0.52, t, E["card"][0] - 0.3, off=E["undim"][1], amp=0.8, period=1.9)
+    a.emit(sc, cam)
+    sc.axis_level = 0.55 + 0.45 * (lvl - 0.5) / 0.5
+    sc.zoom = cam.z
+    sc.cam = (cam.z, cam.cx)
 
 
 S05_CAM = Cam(1.8, float(X(X0[DEMO_I])))   # centred on agent 5; both bracket edges stay in frame
@@ -480,7 +511,8 @@ def focus_look(a, f, others=None):
 def s05(sh, t, sc):
     E = sh["events"]
     e = ease(prog(t, E["zoom_in"]))           # a decisive push: the chapter transition
-    cam = Cam(1 + (S05_CAM.z - 1) * e, 960 + (S05_CAM.cx - 960) * e)
+    z0 = 1.0 + S04_PUSH                       # where S04's slow push ended
+    cam = Cam(z0 + (S05_CAM.z - z0) * e, 960 + (S05_CAM.cx - 960) * e)
     f = demo_focus(sh, t)
     # the bracket opens out of agent 5: it appears hugging agent 5 alone (everyone else dims),
     # then its edges sweep out to eps = 0.20 and the rects they pass light back up
@@ -526,17 +558,28 @@ def demo_move(p, back=False):
     return a
 
 
+def s06_follow(sh, t):
+    """0 -> 1: after agent 5 lands, its bracket glides to its new opinion (its neighbourhood for
+    the next round is centred on itself again)."""
+    m1 = sh["events"]["move"][1]
+    return prog(t, (m1 + 0.05, m1 + 0.95))
+
+
 def s06(sh, t, sc):
     E = sh["events"]
     cam = S05_CAM
     m0, m1 = E["move"]
     a = demo_move(prog(t, E["move"]))
-    ins = inside(X0, X0[DEMO_I], 0.20)
+    pf = s06_follow(sh, t)
+    xc = X0[DEMO_I] + (MEAN5 - X0[DEMO_I]) * ease(pf)
+    ins = inside(a.op, xc, 0.20)
     focus_look(a, 1.0, 1 - 0.8 * (1 - ins))
     listen(a, X0[DEMO_I], 0.20, t, REF.get("S05_listen", sh["start"]), off=E["rays"][0] + 0.2)
+    a.glow[[DEMO_I, DEMO_MATE]] *= 1 + 0.9 * bump((t - m1 + 0.05) / 0.5)      # landing
+    listen(a, xc, 0.20, t, m1 + 0.35)
     a.emit(sc, cam)
     demo_marker(sc, cam, a.wx[DEMO_I], a.wy[DEMO_I], 1.0)
-    bracket(sc, cam, X0[DEMO_I], 0.20, 1.0, INIT)
+    bracket(sc, cam, xc, 0.20, 1.0, MOVE5 if t >= m1 else INIT, snap=settle(pf))
     r0, r1 = E["rays"]
     D = r1 - r0
     px, py = float(X(MEAN5)), Y0 - 110.0
@@ -566,11 +609,12 @@ def s07(sh, t, sc):
         a = _rounds(DEMO_SEQ, sh, t)
     else:
         a = REWIND_DEMO.at(ease(prog(t, E["rewind"])))
-    focus_look(a, 1 - er, 1 - 0.8 * (1 - er) * (1 - inside(X0, X0[DEMO_I], 0.20)))
+    xc = a.op[DEMO_I] if t < E["round:1"][0] else X0[DEMO_I]
+    focus_look(a, 1 - er, 1 - 0.8 * (1 - er) * (1 - inside(X0, xc, 0.20)))
     a.emit(sc, cam)
     if t < E["round:1"][0]:
         demo_marker(sc, cam, a.wx[DEMO_I], a.wy[DEMO_I], 1 - smooth(pr / 0.7))
-    bracket(sc, cam, X0[DEMO_I], 0.20, 1 - er, INIT)
+    bracket(sc, cam, xc, 0.20, 1 - er, MOVE5 if pr <= 0 else INIT, snap=settle(pr))
     pf = prog(t, E["flash"])
     if 0 < pf < 1:
         o = 0.12 * math.sin(math.pi * pf)
@@ -616,10 +660,26 @@ def s09(sh, t, sc):
     _rounds(WIDE, sh, t).emit(sc, CAM1)
 
 
+def rise_glint(a, t, on, period=1.7, amp=1.0, sigma=26.0):
+    """Light rising through a stacked block, bottom to top, every `period` s (level/glow only)."""
+    if t <= on:
+        return
+    k = smooth((t - on) / 0.5) * amp
+    u = ((t - on) / period) % 1.0
+    top, bot = a.wy.min() - 40.0, a.wy.max() + 40.0
+    yg = bot + (top - bot) * u
+    g = np.exp(-0.5 * ((a.wy - yg) / sigma) ** 2) * k * math.sin(math.pi * u) ** 0.5
+    a.level = a.level * (1 + 0.16 * g)
+    a.glow = a.glow * (1 + 0.8 * g)
+
+
 def s10(sh, t, sc):
     E = sh["events"]
-    _rounds(WIDE, sh, t).emit(sc, CAM1)
-    sc.glow_gain = 1.0 + 0.4 * bump(prog(t, E["glow"]))
+    a = _rounds(WIDE, sh, t)
+    rise_glint(a, t, E["accent"][0] + 0.6)
+    a.emit(sc, CAM1)
+    sc.glow_gain = (1.0 + 0.4 * bump(prog(t, E["glow"]))
+                    + 0.06 * math.sin(2 * math.pi * (t - E["glow"][1]) / 2.6) * smooth((t - E["glow"][1]) / 0.6))
     t0 = E["accent"][0]
     xc = float(X(WIDE[-1].op.mean()))
     for f in (M.ripple(t, t0, xc, Y0 + 150.0, 820.0, dur=1.5, amp=0.22),
@@ -711,15 +771,47 @@ def s12(sh, t, sc):
     bracket(sc, CAM1, a.op[50], 0.20, 1 - eo, INIT)
 
 
+GAP_13 = float(NSEQ[-1].op.max() - NSEQ[-1].op.min())     # 0.387: the gap between the clusters
+
+
 def s13(sh, t, sc):
+    """The split locks: a brief cool dip runs through both blocks (no ripple: a lock, not a
+    celebration) and a hairline gap-measure snaps out between the two cluster centres, labelled
+    with the gap from hk_sim."""
     E = sh["events"]
-    Ag.of(NSEQ[-1]).emit(sc, CAM1)
+    a = Ag.of(NSEQ[-1])
     t0 = E["lock"][0]
-    sc.glow_gain = 1.0 + 0.03 * math.sin(2 * math.pi * (t - sh["start"]) / 4.0) + 0.28 * bump((t - t0) / 0.7)
-    for gx, hw, hh, g in NSEQ[-1].groups:
-        for f in (M.ripple(t, t0 + 0.05, gx, Y0 + 120.0, 380.0, dur=1.1, amp=0.20),):
-            if f:
-                sc.fx.append(f)
+    u = t - t0
+    dip = 0.22 * min(1.0, u / 0.12) * (1 - smooth((u - 0.12) / 0.9)) if u > 0 else 0.0
+    a.level = a.level * (1 - dip)
+    a.glow = a.glow * (1 - 1.6 * dip)
+    a.emit(sc, CAM1)
+    sc.glow_gain = 1.0 + 0.04 * math.sin(2 * math.pi * (t - sh["start"]) / 3.0)
+    gap_measure(sc, t, E["measure"], NSEQ[-1])
+
+
+def gap_measure(sc, t, win, L, y=None):
+    """Hairline between the leftmost and rightmost cluster centres of layout L, snapping out from
+    the middle with end ticks, the gap (from the state's opinions) typed above it."""
+    m0, m1 = win
+    p = prog(t, (m0, m0 + 0.45))
+    o = smooth((t - m0) / 0.12) * (1 - smooth((t - m1 + 0.35) / 0.35))
+    if o <= 1e-3:
+        return
+    xl, xr = float(X(L.op.min())), float(X(L.op.max()))
+    top = float(L.wy.min()) - RECT_H / 2
+    y = (top - 30.0) if y is None else y
+    e = ease_out_expo(p)
+    xm = 0.5 * (xl + xr)
+    a, b = xm + (xl - xm) * e, xm + (xr - xm) * e
+    sc.line(a, y, b, y, 1.0, GOLD, 0.55 * o, 0.45)
+    tk = smooth((p - 0.7) / 0.3)
+    if tk > 1e-3:
+        for xe in (xl, xr):
+            sc.line(xe, y - 7.0 * tk, xe, y + 7.0 * tk, 1.0, GOLD, 0.6 * o, 0.45)
+    lab = smooth((t - m0 - 0.35) / 0.3) * o
+    if lab > 1e-3:
+        sc.labels.append((f"{L.op.max() - L.op.min():.2f}", xm, y - 16.0, 0.62 * lab, 14))
 
 
 S14_PUSH = 0.3
@@ -816,12 +908,28 @@ def s16_flash(p3):
     return 1 + 1.6 * bump(p3 / 0.3)
 
 
+def s16_beats(sh, t):
+    """Per beat: (narrowing progress, bracket snap weight). Each beat narrows quickly at first
+    (70 % in 0.7 s) and then keeps creeping until just before the next beat, so the bracket and
+    the dimming of everyone outside it never stop; the edges settle into a gap only at the end."""
+    E = sh["events"]
+    starts = [E[f"beat:{k}"][0] for k in range(1, 5)]
+    ends = starts[1:] + [sh["end"] - 0.1]
+    es, snaps = [], []
+    for a0, b0 in zip(starts, ends):
+        D = max(b0 - 0.2 - a0, 0.8)
+        u = t - a0
+        es.append(clamp01(0.7 * ease_out(u / 0.7) + 0.3 * smooth(u / D)) if u > 0 else 0.0)
+        snaps.append(1.0 if u <= 0 else max(1 - smooth(u / 0.12), smooth((u - D + 0.3) / 0.3)))
+    return es, snaps
+
+
 def s16(sh, t, sc):
     E = sh["events"]
-    ps = [prog(t, E[f"beat:{k}"]) for k in range(1, 5)]
+    es, snaps = s16_beats(sh, t)
     b3 = E["beat:3"]
     p3 = prog(t, (b3[0], b3[0] + 0.75))
-    eps, level, dx, hs = _s16_state([ease(p) for p in ps], p3)
+    eps, level, dx, hs = _s16_state(es, p3)
     a = Ag.of(INIT)
     a.level, a.wx = level, a.wx + dx
     a.hscale = hs
@@ -833,8 +941,7 @@ def s16(sh, t, sc):
                     dur=0.8, amp=0.45, half=(2.0, 3.0), squash=0.8)
         if f:
             sc.fx.append(f)
-    bracket(sc, CAM1, X0[50], eps, 1.0, INIT, snap=math.prod(settle(p) for p in ps),
-            pos=(INIT.op, a.wx))
+    bracket(sc, CAM1, X0[50], eps, 1.0, INIT, snap=math.prod(snaps), pos=(INIT.op, a.wx))
 
 
 def s17(sh, t, sc):
@@ -882,9 +989,12 @@ def s18(sh, t, sc):
     old.wx = cam_old.x(old.wx)                     # (old rects drawn in screen space below)
     old.wy = cam_old.y(old.wy)
     zw = 1.0 + S17_PUSH * (1 - ease(prog(t, E["reset"])))
-    sc.cam = (zw, 960.0)                           # dust / axis settle back with the wipe
-    sc.axis_cam = Cam(zw, 960.0)
+    sc.cam = (zw, 960.0)                           # dust settles back with the wipe
     f, bx = M.beam(t, E["reset"], amp=0.17)
+    # the axis under each rect set uses that set's camera, split at the beam
+    sc.axis_cam = CAM1 if t >= E["reset"][1] else cam_old
+    if bx is not None:
+        sc.axis_split = (bx, CAM1, cam_old)
     if bx is None:
         done = t >= E["reset"][1]
         old.level[:] = 0.0 if done else 1.0
@@ -919,22 +1029,70 @@ def s19(sh, t, sc):
     thread_pulses(sc, CAM1, a, t, E["threads"][1] - 0.1, 1.0)
 
 
+def _contact_frac():
+    """Progress of the merge tween (Ag.tween, BRIDGE round 35 -> 36) at which the two blocks
+    touch: the facing columns are at most one rect width apart (edge gap <= RECT_W)."""
+    A, B = BRIDGE[MERGE_ROUND - 1], BRIDGE[MERGE_ROUND]
+    for p in np.linspace(0.0, 1.0, 4001):
+        a = Ag.tween(A, B, p)
+        if a.wx[RIGHT].min() - a.wx[LEFT].max() <= 2 * RECT_W:
+            return float(p)
+    return 1.0
+
+
+MERGE_CONTACT = _contact_frac()
+
+
+def merge_time(sh):
+    """Absolute time the blocks touch in S20 (HUD switch, accent, glow)."""
+    a, b = sh["events"][f"round:{MERGE_ROUND}"]
+    return a + MERGE_CONTACT * (b - a)
+
+
+def creep_index(sh, t):
+    """Fractional round index of S20's creep at t (rounds 2..35 over the 'creep' event), from
+    the same speed profile timeline.creep used to place the round windows: integer crossings
+    land exactly on the window edges. None outside the creep."""
+    E = sh["events"]
+    if "creep" not in E:
+        return None
+    t0, t1 = E["creep"]
+    if t < t0 or t > t1:
+        return None
+    ks = sorted(int(k.split(":")[1]) for k in E if k.startswith("round:"))
+    ks = [k for k in ks if k < MERGE_ROUND]
+    n = ks[-1] - ks[0] + 1
+    return ks[0] - 1 + n * float(TL.creep_profile((t - t0) / (t1 - t0)))
+
+
 def s20(sh, t, sc):
+    """Rounds 2-35 are one continuous creep: one fractional round index (creep_index) runs
+    through the states, interpolated linearly between consecutive ones (every state is passed
+    through exactly, no per-round easing or hold, so nothing judders). The merge round is a
+    normal tween."""
     E = sh["events"]
     k0, k1, e = round_pos(t, E)
-    a = Ag.tween(BRIDGE[k0], BRIDGE[k1], e)
+    ci = creep_index(sh, t)
+    if ci is not None:
+        k = min(int(math.floor(ci)), MERGE_ROUND - 2)
+        a = Ag.mix(BRIDGE[k], BRIDGE[k + 1], clamp01(ci - k))
+    elif k1 < MERGE_ROUND:
+        a = Ag.of(BRIDGE[k1])
+    else:
+        a = Ag.tween(BRIDGE[k0], BRIDGE[k1], e)
     _bridge_look(a)
     a.emit(sc, CAM1)
-    th = 1 - smooth(prog(t, E[f"round:{MERGE_ROUND}"]))
+    tm = merge_time(sh)
+    r0 = E[f"round:{MERGE_ROUND}"][0]
+    th = 1 - smooth(prog(t, (r0, tm)))
     threads(sc, CAM1, a, 1.0, 0.5 * th)
     thread_pulses(sc, CAM1, a, t, REF.get("S19_pulses", sh["start"]), th)
-    tm = E["merge"][0]
     xc = float(X(BRIDGE[MERGE_ROUND].op.mean()))
-    sc.glow_gain = 1.0 + 0.35 * bump((t - tm + 0.1) / 1.0)
-    for f in (M.ripple(t, tm - 0.05, xc, Y0 + 150.0, 980.0, dur=1.7, amp=0.25),
-              M.burst(t, tm - 0.05, xc, Y0, n=60, seed=20, half=(66.0, 150.0), amp=0.55,
+    sc.glow_gain = 1.0 + 0.35 * bump((t - tm + 0.05) / 1.0)
+    for f in (M.ripple(t, tm, xc, Y0 + 150.0, 980.0, dur=1.7, amp=0.25),
+              M.burst(t, tm, xc, Y0, n=60, seed=20, half=(66.0, 150.0), amp=0.55,
                       speed=(180.0, 480.0), dur=1.5),
-              M.glow(t, tm - 0.05, xc, Y0, 340.0, 250.0, dur=1.4, amp=0.085)):
+              M.glow(t, tm, xc, Y0, 340.0, 250.0, dur=1.4, amp=0.085)):
         if f:
             sc.fx.append(f)
 
@@ -964,19 +1122,45 @@ def _diagram(sc, t, E):
     rgb = opinion_rgb(base.op)
     rgb[BRIDGE_I] = WHITE_GOLD
     lv[BRIDGE_I], gl[BRIDGE_I] = o, 1.6
+    tension = smooth(pa) if t < b0 else 0.0        # the threads tighten as the gap nears 2 eps
+    gl[BRIDGE_I] *= 1 + 0.5 * tension
     sc.add_rects(xs, ys, RECT_W * k, RECT_H * k, rgb, lv, gl, life=True)
     gap = 3.0
     bx, cy = xs[BRIDGE_I], ys[BRIDGE_I]
-    for a_x, b_x in ((xs[LEFT].max() + RECT_W * k / 2 + gap, bx - RECT_W * k / 2 - gap),
-                     (xs[RIGHT].min() - RECT_W * k / 2 - gap, bx + RECT_W * k / 2 + gap)):
+    pulses_x, pulses_a = [], []
+    for side, (a_x, b_x) in ((-1, (xs[LEFT].max() + RECT_W * k / 2 + gap, bx - RECT_W * k / 2 - gap)),
+                             (1, (xs[RIGHT].min() - RECT_W * k / 2 - gap, bx + RECT_W * k / 2 + gap))):
         if t < b0:
-            sc.line(a_x, cy, b_x, cy, 1.0, GOLD, 0.6 * o, 0.5)
+            sc.line(a_x, cy, b_x, cy, 1.0, GOLD, (0.5 + 0.3 * tension) * o, 0.5 + 0.4 * tension)
+            # light pulses along the thread, alternating out / in (as in S19), until it snaps
+            n = int((t - i1) / 0.5)
+            for j in range(max(0, n - 1), n + 1):
+                u = (t - i1 - j * 0.5) / 0.45
+                if 0 < u < 1:
+                    p0, p1 = (b_x, a_x) if j % 2 == 0 else (a_x, b_x)
+                    pulses_x.append(p0 + (p1 - p0) * smooth(u))
+                    pulses_a.append(0.38 * o * math.sin(math.pi * u) ** 0.7)
         else:                                      # snap: halves recoil to their ends and fade
             u = ease_out(prog(t, (b0, b1 + 0.15)))
             mid = (a_x + b_x) / 2
             al = 0.6 * o * (1 - smooth(prog(t, (b0, b1 + 0.25))))
             sc.line(a_x, cy, a_x + (mid - a_x) * (1 - u), cy, 1.0, GOLD, al, 0.5)
             sc.line(b_x, cy, b_x + (mid - b_x) * (1 - u), cy, 1.0, GOLD, al, 0.5)
+    if pulses_x:
+        sc.fx.append(dict(type="pulses", y=cy, xs=pulses_x, amps=pulses_a, sigma=3.0))
+    # reach measure under the diagram: bridge-to-cluster distance lines stretch outward; the
+    # fixed ticks mark eps = 0.20 (everyone but the bridge); the threads snap as they pass it
+    ym = ys.min() - RECT_H * k / 2 - 16.0          # above the schematic, clear of the row below
+    reach = eps_o * 1600.0 * k
+    om = o * (1 - smooth(prog(t, (b1, b1 + 0.6))))
+    if om > 1e-3:
+        for side, xc_ in ((-1, xs[LEFT].mean()), (1, xs[RIGHT].mean())):
+            sc.line(bx, ym, xc_, ym, 1.0, GOLD, 0.40 * om, 0.3)
+            sc.line(xc_, ym - 4.0, xc_, ym + 4.0, 1.0, GOLD, 0.45 * om, 0.3)
+            xr = bx + side * reach
+            sc.line(xr, ym - 7.0, xr, ym + 7.0, 1.0, GOLD, (0.5 + 0.3 * tension) * om, 0.4)
+            sc.labels.append(("ε", xr, ym - 13.0, 0.5 * om, 13))
+        sc.line(bx, ym - 5.0, bx, ym + 5.0, 1.0, GOLD, 0.45 * om, 0.3)
 
 
 def s21(sh, t, sc):
@@ -1038,6 +1222,8 @@ def s22(sh, t, sc):
     a.level = a.level * f
     a.emit(sc, CAM1)
     sc.fade = f
+    if "bg_out" in E:            # the world recedes first; the question fades last
+        sc.bg_level = 1 - smooth(prog(t, E["bg_out"]))
     sc.axis_level = 1 - smooth(prog(t, (c0, c0 + 0.8)))
 
 
@@ -1052,7 +1238,8 @@ MB_MIN = 1.5         # design px per frame below which a frame is rendered witho
 MB_STEP = 6.0        # max raster px a rect moves within one sub-interval (<= the 6 px gap
                      # between rects, so neighbouring smears never overlap inside a sub-frame)
 MB_LINE_STEP = 40.0  # lines are smeared analytically too and never overlap: coarser sampling
-MB_MAX_SUB = 24
+MB_MAX_SUB = 64      # only the S15 push-through needs this many (a few frames); every other
+                     # move stays far below it
 
 
 def motion_px(sa, sb):
@@ -1093,9 +1280,18 @@ CAP_PRE, CAP_POST, CAP_SEP = 0.2, 0.35, 0.05   # caption shown this much before 
 
 
 def _stats(x, skip=None):
-    """(groups, spread) of a state exactly as hk_sim.report counts them."""
+    """(groups, spread) of a state exactly as hk_sim.report counts them. groups is None while
+    hk_sim.groups sees a single chain that is wider than its own gap (a continuum, not a
+    cluster): the HUD then shows 'GROUPS —' rather than a misleading 1."""
     o = np.delete(x, skip) if skip is not None else np.asarray(x)
-    return len(hk_sim.groups(o)), float(o.max() - o.min())
+    g, spread = len(hk_sim.groups(o)), float(o.max() - o.min())
+    if g == 1 and spread >= 0.02:
+        g = None
+    return g, spread
+
+
+def _groups_txt(g):
+    return "—" if g is None else str(g)
 
 
 EXP1 = [_stats(L.op) for L in WIDE]
@@ -1218,7 +1414,7 @@ class Show:
                 r, k, p = 0, 0, 0.0
             g, sp = EXP1[r]
             prm["spark"] = dict(vals=SPREAD1, n_max=SPARK_N_EXP, k=k, p=p, scale=1.0)
-            return f"ROUND {r:03d} · ε 0.30 · GROUPS {g} · SPREAD {sp:.2f}", prm
+            return f"ROUND {r:03d} · ε 0.30 · GROUPS {_groups_txt(g)} · SPREAD {sp:.2f}", prm
         if name == "exp2":
             ghost = (SPREAD1, SPARK_N_EXP)
             if sid == "S11":
@@ -1241,7 +1437,7 @@ class Show:
                 g, sp = EXP2[-1]
                 eps, vals, k, p = "0.20", SPREAD2, len(NARROW) - 1, 0.0
             prm["spark"] = dict(vals=vals, n_max=SPARK_N_EXP, k=k, p=p, scale=1.0, ghost=ghost)
-            return f"ROUND {r:03d} · ε {eps} · GROUPS {g} · SPREAD {sp:.2f}", prm
+            return f"ROUND {r:03d} · ε {eps} · GROUPS {_groups_txt(g)} · SPREAD {sp:.2f}", prm
         # bridge
         if sid == "S18":
             r, k, p = 0, 0, 0.0
@@ -1254,8 +1450,16 @@ class Show:
         else:
             r, k, p, be = MERGE_ROUND, MERGE_ROUND, 0.0, "0.40"
         g, sp = BRS[r]
+        if sid == "S20" and r == MERGE_ROUND:
+            # the merge round: counts switch when the blocks actually touch
+            a0, tm = E[f"round:{MERGE_ROUND}"][0], merge_time(sh)
+            if t < tm:
+                g, sp = BRS[r - 1]
+            p = clamp01((t - a0) / max(tm - a0, 1e-6))
+            if t >= tm:
+                prm["flash"] = _flash(t, tm)
         prm["spark"] = dict(vals=SPREADB, n_max=len(BRIDGE) - 1, k=k, p=p, scale=0.4)
-        return f"ROUND {r:03d} · ε 0.20 · BRIDGE ε {be} · GROUPS {g} · SPREAD {sp:.2f}", prm
+        return f"ROUND {r:03d} · ε 0.20 · BRIDGE ε {be} · GROUPS {_groups_txt(g)} · SPREAD {sp:.2f}", prm
 
     # -- one scene ------------------------------------------------------------------------
     def _shot_scene(self, sh, t):
@@ -1295,24 +1499,53 @@ class Show:
         self._texts(sc, sh, t)
         return sc
 
-    def _axis(self, sc, t, d, pulse):
-        ac = getattr(sc, "axis_cam", None)
-        cam = (ac.z, ac.cx) if ac is not None else sc.cam
-        draw = getattr(sc, "axis_draw", 1.0)
-        level = getattr(sc, "axis_level", 1.0) * sc.fade
-        xg = -300.0 + 2520.0 * ((t / 9.0) % 1.0)
-        sc.axis = dict(cam=cam, drift=d, draw=draw, alpha=level, pulse=pulse, glint=xg)
-        if level * draw <= 1e-3:
-            return
+    @staticmethod
+    def _axis_y(sc, cam, d):
+        """Screen y of the axis under camera cam: AXIS_DY below the row (following AXIS_Y_PARALLAX
+        of the zoom), but never closer than AXIS_CLEAR (x zoom) below the lowest visible rect
+        drawn with that same camera, so tall blocks under a push never stand on it."""
         z, cx = cam
         dz, dx, dy = d
         ys = Y0 + AXIS_DY * (1 + AXIS_Y_PARALLAX * (z - 1)) * dz + dy
-        xs = lambda v: ((float(X(v)) - cx) * z) * dz + 960.0 + dx
-        half = (xs(1.0) - xs(0.0)) / 2 * draw
-        for v, lab in ((0.0, "0"), (0.5, "0.5"), (1.0, "1")):
-            x = xs(v)
-            if abs(x - xs(0.5)) <= half + 1.0 and -40 < x < 1960:
-                sc.text("mono_at", lab, 0.30 * level, x=x, y=ys + 31.0, px=12)
+        bot = None
+        for b in sc.rects:
+            c = b.get("cam")
+            if not b.get("life") or c is None or abs(c[0] - z) > 1e-6 or abs(c[1] - cx) > 1e-6:
+                continue
+            m = b["level"] > 0.05
+            if m.any():
+                v = float((b["y"][m] + b["h"][m] / 2).max())
+                bot = v if bot is None else max(bot, v)
+        if bot is not None:
+            ys = max(ys, bot + AXIS_CLEAR * z * dz)
+        return ys
+
+    def _axis(self, sc, t, d, pulse):
+        """The opinion axis: one part per camera (S18's wipe shows two rect sets side by side,
+        each with the axis under its own camera, split at the beam)."""
+        ac = getattr(sc, "axis_cam", None)
+        cam = (ac.z, ac.cx) if ac is not None else sc.cam
+        split = getattr(sc, "axis_split", None)
+        if split is not None:
+            xb, cl, cr = split
+            parts = [((cl.z, cl.cx), -1e9, xb), ((cr.z, cr.cx), xb, 1e9)]
+        else:
+            parts = [(cam, -1e9, 1e9)]
+        parts = [(c, a, b, self._axis_y(sc, c, d)) for c, a, b in parts]
+        draw = getattr(sc, "axis_draw", 1.0)
+        level = getattr(sc, "axis_level", 1.0) * sc.fade
+        xg = -300.0 + 2520.0 * ((t / 9.0) % 1.0)
+        sc.axis = dict(parts=parts, drift=d, draw=draw, alpha=level, pulse=pulse, glint=xg)
+        if level * draw <= 1e-3:
+            return
+        dz, dx, dy = d
+        for (z, cx), c0, c1, ys in parts:
+            xs = lambda v: ((float(X(v)) - cx) * z) * dz + 960.0 + dx
+            half = (xs(1.0) - xs(0.0)) / 2 * draw
+            for v, lab in ((0.0, "0"), (0.5, "0.5"), (1.0, "1")):
+                x = xs(v)
+                if abs(x - xs(0.5)) <= half + 1.0 and -40 < x < 1960 and c0 <= x < c1:
+                    sc.text("mono_at", lab, 0.30 * level, x=x, y=ys + 31.0, px=12, glow=0.6)
 
     @staticmethod
     def _spill(sc):
@@ -1352,6 +1585,10 @@ class Show:
         if h:
             txt, prm = h
             sc.text("hud", txt, f, **prm)
+        dz, dx, dy = sc.drift
+        for txt, x, y, al, px in sc.labels:
+            sc.text("mono_at", txt, al * f, x=(x - 960.0) * dz + 960.0 + dx, y=(y - Y0) * dz + Y0 + dy,
+                    px=px, glow=1.0)
 
     # -- motion blur ----------------------------------------------------------------------
     def motion_bounds(self, t, fps, scale=1.0):

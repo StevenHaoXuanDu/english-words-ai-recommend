@@ -330,6 +330,7 @@ class Scene:
         self.axis = None
         self.bg_level = 1.0
         self.fade = 1.0
+        self.labels = []     # (text, x, y, alpha, px): small mono labels in data-plane design px
 
     def add_rects(self, x, y, w, h, rgb, level, glow, cam=None, life=False, smear=None):
         """cam: (zoom, centre x) the batch was projected with (lets trails remove camera motion).

@@ -1,9 +1,10 @@
 """Global motion layers for render_shots.Show: the things that keep every frame alive.
 
-* drift(t)        slow continuous camera drift (dolly +-0.8 %, float), applied to the whole
-                  data plane at once - rects, brackets, axis ticks - so every rect keeps its
-                  place on the axis (relative x never changes; at most ~8 px of global sway
-                  at the row ends). The parallax dust and nebula carry most of the felt motion.
+* drift(t)        slow continuous camera drift (dolly +-1.3 %, mostly a vertical float of up
+                  to +-9 px), applied to the whole data plane at once - rects, brackets, axis
+                  ticks - so every rect keeps its place on the axis (relative x never changes;
+                  at most ~13 px of global dolly at the row ends). The parallax dust layers
+                  separate visibly under it.
 * life(sc, t)     ambient life in the data: +-1.5 px vertical breathing wave (y only), a soft
                   travelling glint (brightness + glow) and a tiny per-rect shimmer.
 * round_pulse     on every round update a scanline of light passes down over the row
@@ -26,7 +27,8 @@ TRAIL_DT = (0.07, 0.20)          # s: afterimage segment ends
 TRAIL_LEVEL = (0.16, 0.06)       # ... and their brightness relative to the rect
 TRAIL_MIN_PX = 4.0               # world px over TRAIL_DT[1] below which a rect leaves no trail
 BREATH_PX, BREATH_LAMBDA, BREATH_T = 1.5, 900.0, 5.5
-GLINT_PERIOD, GLINT_SIGMA = 7.0, 170.0
+GLINT_PERIOD, GLINT_SIGMA = 6.0, 170.0
+GLINT_LEVEL, GLINT_GLOW = 0.15, 0.6
 SHIMMER = 0.035
 
 
@@ -45,10 +47,10 @@ def bump(u):
 
 # ----------------------------------------------------------------------------- camera drift
 def drift(t):
-    """(zoom, dx, dy): a slow, never-repeating-looking dolly and float (periods 19-37 s)."""
-    dz = 1.0 + 0.005 * math.sin(2 * math.pi * t / 23.0 + 0.7) + 0.003 * math.sin(2 * math.pi * t / 37.0 + 2.1)
-    dx = 2.0 * math.sin(2 * math.pi * t / 29.0 + 0.3)
-    dy = 4.0 * math.sin(2 * math.pi * t / 19.0 + 1.3) + 2.0 * math.sin(2 * math.pi * t / 31.0)
+    """(zoom, dx, dy): a slow, never-repeating-looking dolly and float (periods 13-37 s)."""
+    dz = 1.0 + 0.008 * math.sin(2 * math.pi * t / 21.0 + 0.7) + 0.005 * math.sin(2 * math.pi * t / 37.0 + 2.1)
+    dx = 2.5 * math.sin(2 * math.pi * t / 29.0 + 0.3)
+    dy = 6.0 * math.sin(2 * math.pi * t / 17.0 + 1.3) + 3.0 * math.sin(2 * math.pi * t / 13.0)
     return dz, dx, dy
 
 
@@ -99,8 +101,8 @@ def life(sc, t, amount=1.0):
         ph = ((i * 0.6180339887) % 1.0) * 2 * np.pi
         fr = 0.55 + 0.45 * ((i * 0.7548776662) % 1.0)
         sh = SHIMMER * np.sin(2 * np.pi * fr * t + ph)
-        b["level"] = b["level"] * (1.0 + amount * (0.07 * g + sh))
-        b["glow"] = b["glow"] * (1.0 + amount * 0.35 * g)
+        b["level"] = b["level"] * (1.0 + amount * (GLINT_LEVEL * g + sh))
+        b["glow"] = b["glow"] * (1.0 + amount * GLINT_GLOW * g)
 
 
 # ----------------------------------------------------------------------------- round pulse

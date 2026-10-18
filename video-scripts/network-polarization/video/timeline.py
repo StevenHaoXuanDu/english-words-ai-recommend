@@ -9,6 +9,8 @@ reading time. All times in timeline.json are absolute seconds from the start.
 import json
 import os
 
+import numpy as np
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.environ.get(
     "BUILD",
@@ -20,12 +22,14 @@ FPS = 30
 # Each chunk is one caption. A chunk given as (text, False) gets no caption
 # because a title card shows the same words.
 SHOTS = [
-    dict(id="S01", ch=1, base=2.8, chunks=[]),
-    dict(id="S02", ch=1, base=4.0, lead=0.5, tail=0.8,
+    dict(id="S01", ch=1, base=1.8, chunks=[]),
+    dict(id="S02", ch=1, base=3.7, lead=0.5, tail=0.8,
          chunks=["一个小村子，住着一百个人。"]),
     dict(id="S03", ch=1, base=4.5, lead=0.25, tail=0.8,
          chunks=["对同一件小事，每个人的看法，都有一点不同。"]),
-    dict(id="S04", ch=1, base=5.0, lead=0.25, gap=0.35, tail=0.9,
+    # S04: the title card (chunk 2) starts while caption 1 is still up (negative gap: allowed
+    # before a chunk that is shown as a card, not as a caption)
+    dict(id="S04", ch=1, base=4.2, lead=0.2, gap=-0.55, tail=1.1,
          chunks=["这个村子只有一条规则：", ("你只听，和你差不多的人。", False)]),
     dict(id="S05", ch=2, base=5.0, lead=0.35, gap=0.35, tail=0.7,
          chunks=["“差不多”，不是住得近，是想得近。", "它只听括号里的这些人。"]),
@@ -37,13 +41,13 @@ SHOTS = [
          chunks=["第一次实验：每个人愿意听的范围，宽一些。"]),
     dict(id="S09", ch=3, base=5.0, lead=0.3, gap=0.6, tail=0.5,
          chunks=["最先动的，是两头的人。", "然后，整排人一点点向中间收拢。"]),
-    dict(id="S10", ch=3, base=4.0, lead=0.2, gap=0.35, tail=0.75,
+    dict(id="S10", ch=3, base=4.0, lead=0.2, gap=0.35, tail=0.45,
          chunks=["第四轮。", "一百个人，站到了一起。"]),
     dict(id="S11", ch=4, base=6.0, lead=0.35, gap=0.45, tail=0.5,
          chunks=["同样的人，同样的起点，同样的规则。", "只改一件事：把这个范围，收窄三分之一。"]),
     dict(id="S12", ch=4, base=6.0, lead=0.25, gap=0.35, tail=0.5,
          chunks=["人们仍然在靠近。", "只是，只靠近身边的人。", "中间的几个人，被两边各自拉走。"]),
-    dict(id="S13", ch=4, base=3.0, lead=0.25, tail=0.8,
+    dict(id="S13", ch=4, base=3.0, lead=0.25, tail=0.5,
          chunks=["第七轮之后，再也没有任何变化。"]),
     dict(id="S14", ch=4, base=9.0, lead=0.4, gap=0.55, tail=1.8,
          chunks=["没有人撒谎。", "没有人被收买。", "没有人是坏人。", "大家只是，都在听和自己差不多的人。"]),
@@ -80,7 +84,7 @@ ANNOTATIONS = {
     "S09": "ROUND 1 → 3 · SPREAD 1.00 → 0.71 → 0.46 → 0.29",
     "S10": "ROUND 4 · CONSENSUS · 1 CLUSTER · x = 0.50",
     "S11": "EXPERIMENT 2 · ε = 0.30 → 0.20",
-    "S12": "ROUND 3 → 7 · GROUPS 9 → 8 → 4 → 2 → 2",
+    "S12": [("ROUND 3 → 7 · GROUPS 9 → 8 → 4 → 2 → 2", "round:3", None)],
     "S13": "ROUND {r} · 2 CLUSTERS · 50 | 50 · GAP 0.39 > ε",
     "S14": "NO VILLAINS · SAME PEOPLE · SAME RULE · NARROWER ε",
     "S15": "REAL WORLD · NO SINGLE ε",
@@ -88,18 +92,19 @@ ANNOTATIONS = {
             ("BLOCK", "c3s", "c4s"), ("REPLY THREAD · PICK A SIDE", "c4s", None)],
     "S17": "ILLUSTRATIVE · A MODEL, NOT A MEASUREMENT",
     "S18": "1 AGENT · ε : 0.20 → 0.40 · EVERYONE ELSE UNCHANGED",
-    "S19": "ROUND 1 · BRIDGE x = 0.50 · DISTANCE 0.19 ≤ ε, BOTH SIDES",
+    "S19": [("ROUND 1 · BRIDGE x = 0.50 · DISTANCE 0.19 ≤ ε, BOTH SIDES", "round:1+0.3", None)],
     "S20": [("ROUND {r} · BRIDGE ε = 0.40 · OTHERS ε = 0.20", 0.0, "merge1"),
             ("MERGED AT ROUND 36 · THE SPLIT SETTLED AT ROUND 7", "merge1", None)],
     "S21": "REQUIRES GAP ≤ 2ε · HERE 0.39 ≤ 0.40",
     "S22": [("ε = ?", 0.5, "c1e+0.2"),
             ("Hegselmann & Krause, JASSS 5(3), 2002 · SIMULATION: N = 100, EVENLY SPACED START",
-             "c1e+0.45", "c1e+4.0")],
+             "c1e+0.2", "c1e+4.1")],
 }
 
 
 READ_MIN = 1.2          # s: no caption is up for less than this
 MIN_GAP = 0.6           # s between consecutive captions of a shot: room for the exit / reveal
+MERGE_CONTACT = 0.5115  # fraction of the S20 round-36 tween at which the blocks touch
 
 
 def reading_time(text):
@@ -123,18 +128,46 @@ def rounds(first, last, t0, t1, frac=0.75, accel=1.0):
     return ev
 
 
+CREEP_RAMP = (0.22, 0.14)     # S20 creep: speed ramps up over this fraction, eases out over this
+
+
+def creep_profile(u, ramp_in=CREEP_RAMP[0], ramp_out=CREEP_RAMP[1]):
+    """Fraction (0..1) of a continuous creep done at progress u (0..1, scalar or array): its
+    speed ramps up (smoothstep) over the first ramp_in, holds, and eases to rest over the last
+    ramp_out. render_shots evaluates the very same profile for S20's fractional round index."""
+    m = 4000
+    g = np.linspace(0.0, 1.0, m + 1)
+    a = np.clip(g / ramp_in, 0, 1)
+    b = np.clip((1 - g) / ramp_out, 0, 1)
+    v = a * a * (3 - 2 * a) * (b * b * (3 - 2 * b))
+    f = np.concatenate([[0.0], np.cumsum(0.5 * (v[1:] + v[:-1]))])
+    return np.interp(u, g, f / f[-1])
+
+
+def creep(first, last, t0, t1):
+    """Contiguous round windows for a continuous creep through rounds first..last over [t0, t1]:
+    round k's window is where the profile's fractional round index runs from k-1 to k. The
+    renderer interpolates the states along that one index (no per-round easing, no hold), so
+    every state is passed through exactly and the motion never stutters."""
+    n = last - first + 1
+    g = np.linspace(0.0, 1.0, 20001)
+    edges = np.interp(np.arange(n + 1) / n, creep_profile(g), g)
+    return {f"round:{first + k}": [t0 + (t1 - t0) * float(edges[k]), t0 + (t1 - t0) * float(edges[k + 1])]
+            for k in range(n)}
+
+
 def shot_events(sid, d, c):
     """Shot-relative event windows [t0, t1]. c = list of (start, end) per chunk."""
     cs = lambda k: c[k - 1][0]
     ce = lambda k: c[k - 1][1]
     if sid == "S01":
-        return {"rect_in": [0.25, 1.3]}
+        return {"rect_in": [0.2, 1.05]}
     if sid == "S02":
         return {"light_up": [0.1, 2.4]}
     if sid == "S03":
         return {"pan": [0.0, d]}
     if sid == "S04":
-        return {"dim": [0.05, 0.5], "card": [cs(2) - 0.2, ce(2) + 0.5], "undim": [d - 0.6, d - 0.1]}
+        return {"dim": [0.05, 0.5], "card": [cs(2) - 0.2, cs(2) + 3.05], "undim": [d - 0.75, d - 0.1]}
     if sid == "S05":
         return {"zoom_in": [0.0, 1.2], "bracket_in": [cs(2) - 0.5, cs(2) + 0.35]}
     if sid == "S06":
@@ -146,7 +179,7 @@ def shot_events(sid, d, c):
     if sid == "S08":
         return {"sweep": [0.0, 0.75], "bracket_in": [0.2, 0.9], "bracket_out": [d - 0.55, d - 0.1]}
     if sid == "S09":
-        return rounds(1, 3, 0.3, d - 0.15, frac=0.6)
+        return rounds(1, 3, 0.3, d - 0.15, frac=0.8)
     if sid == "S10":
         return {"round:4": [0.0, 0.85], "glow": [0.85, 1.7], "accent": [0.85, 2.3]}
     if sid == "S11":
@@ -158,7 +191,7 @@ def shot_events(sid, d, c):
         ev.update(rounds(1, 7, 0.3, d - 0.2, frac=0.7))
         return ev
     if sid == "S13":
-        return {"lock": [0.0, 1.2], "fast_forward": [0.5, d - 0.35]}
+        return {"lock": [0.0, 1.2], "measure": [0.15, d - 0.25], "fast_forward": [0.5, d - 0.35]}
     if sid == "S14":
         ne = ce(len(c))
         return {"push": [0.0, d], "silence": [ne + 0.1, ne + 1.5], "piano": [ne + 1.5, ne + 1.5]}
@@ -179,18 +212,24 @@ def shot_events(sid, d, c):
     if sid == "S19":
         return {"round:1": [0.25, 1.25], "threads": [1.4, 2.2]}
     if sid == "S20":
-        ev = rounds(2, 35, 0.25, cs(2), frac=0.92, accel=1.03)
+        ev = creep(2, 35, 0.1, cs(2))
+        ev["creep"] = [0.1, cs(2)]
         ev["round:36"] = [cs(2) + 0.2, cs(2) + 0.95]
-        ev["merge"] = [cs(2) + 0.5, cs(2) + 0.5]       # the blocks touch (x lands early in a tween)
+        # the blocks touch at MERGE_CONTACT of the round-36 tween (render_shots computes it from
+        # the tween and checks this value)
+        ev["merge"] = [cs(2) + 0.2 + MERGE_CONTACT * 0.75] * 2
         return ev
     if sid == "S21":
         dur2 = ce(2) - cs(2)
         b = cs(2) + 0.55 * dur2
-        return {"dim": [0.15, 0.6], "diagram_in": [cs(2) - 0.2, cs(2) + 0.35],
+        return {"dim": [0.15, 0.6], "diagram_in": [cs(1) + 0.45, cs(1) + 1.0],
                 "break": [b, b + 0.3], "diagram_out": [d - 1.0, d - 0.45], "undim": [d - 0.7, d - 0.1]}
     if sid == "S22":
         e = ce(1)
-        return {"collapse": [0.0, 1.1], "card": [cs(1) - 0.2, e + 2.2], "black": [e + 2.2, e + 2.8]}
+        # the question holds to the end; the background recedes first, then card, citation and
+        # the last rect fade together (about 0.15 s of true black remain)
+        return {"collapse": [0.0, 1.1], "card": [cs(1) - 0.2, e + 3.95], "black": [e + 3.5, e + 4.1],
+                "bg_out": [e + 3.0, e + 4.25]}
     return {}
 
 
@@ -217,15 +256,18 @@ def build():
     t = 0.0
     shots = []
     for s in SHOTS:
-        lead, gap, tail = s.get("lead", 0.5), max(MIN_GAP, s.get("gap", 0.4)), s.get("tail", 0.8)
+        lead, tail = s.get("lead", 0.5), s.get("tail", 0.8)
         items = [(x, True) if isinstance(x, str) else x for x in s["chunks"]]
         lens = [reading_time(txt) for txt, _ in items]
         c, cur = [], lead
         for k, L in enumerate(lens):
             if "beats" in s:
                 cur = lead + sum(max(s["beats"], lens[j] + 0.5) for j in range(k))
+            elif k:                       # gap before chunk k; a card chunk may overlap
+                g = s.get("gap", 0.4)
+                cur = c[-1][1] + (g if not items[k][1] else max(MIN_GAP, g))
             c.append((cur, cur + L))
-            cur += L + gap
+            cur += L
         need = (c[-1][1] + tail) if c else 0.0
         if "beats" in s:
             need = lead + sum(max(s["beats"], L + 0.5) for L in lens) + tail

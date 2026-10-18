@@ -29,11 +29,12 @@ from scipy import ndimage
 from render_core import GOLD, H, W, X, Y0, hex_rgb
 
 NEB_W, NEB_H = 160, 90               # nebula grid: 12 design px per cell
-NEB_PEAK = 0.050                     # brightest nebula value (sRGB 0..1; rects are ~0.75-0.9)
+NEB_PEAK = 0.100                     # brightest nebula value (sRGB 0..1; rects are ~0.75-0.9)
 SPILL_CAP, SPILL_GAIN, SPILL_SIGMA = 0.040, 0.22, 4.5   # data-coloured haze (cells)
 AXIS_DY = 190.0                      # axis: design px below the row centreline at zoom 1
 AXIS_Y_PARALLAX = 0.35               # ... and how much of the zoom its height follows
 AXIS_ALPHA, TICK_ALPHA = 0.20, 0.26  # hairline / tick brightness (x gold)
+RIPPLE_FLOOR = 790.0                 # accent ripples fade to nothing by this design y
 AMBER = hex_rgb("#C98F4A")
 DUST_RGB = np.array([hex_rgb("#F2D9A0"), hex_rgb("#E8C066"), hex_rgb("#D9A25A")])
 
@@ -79,9 +80,9 @@ def layer_xy(wx, wy, cam, drift, par):
 # ----------------------------------------------------------------------------- dust
 class Dust:
     """Deterministic particle field. Layers: (count, parallax, size px, alpha, speed px/s)."""
-    LAYERS = [(140, 0.22, (0.65, 0.95), (0.16, 0.34), (3.0, 7.0)),
-              (70, 0.55, (0.95, 1.45), (0.22, 0.42), (6.0, 12.0)),
-              (22, 1.25, (2.6, 4.4), (0.05, 0.10), (12.0, 20.0))]
+    LAYERS = [(140, 0.22, (0.65, 0.95), (0.18, 0.36), (4.0, 9.0)),
+              (74, 0.55, (0.95, 1.45), (0.31, 0.59), (8.0, 15.0)),
+              (26, 1.25, (2.2, 3.8), (0.14, 0.22), (15.0, 25.0))]
     MARGIN = 60.0
 
     def __init__(self, seed=1017):
@@ -180,8 +181,8 @@ class Background:
         rng = np.random.default_rng(2024)
         # nebula envelopes: base centre, drift amplitude/period, sizes, weight
         self.blobs = [dict(c=(rng.uniform(300, 1620), rng.uniform(260, 820)),
-                           a=(rng.uniform(120, 260), rng.uniform(60, 140)),
-                           p=(rng.uniform(45, 85), rng.uniform(35, 70)), ph=rng.uniform(0, 6.3, 2),
+                           a=(rng.uniform(150, 280), rng.uniform(70, 150)),
+                           p=(rng.uniform(22, 40), rng.uniform(18, 34)), ph=rng.uniform(0, 6.3, 2),
                            sg=(rng.uniform(380, 620), rng.uniform(220, 340)), w=rng.uniform(0.55, 1.0))
                       for _ in range(5)]
 
@@ -203,10 +204,10 @@ class Background:
         env += 0.45 * np.exp(-0.5 * ((wy - Y0) / 150.0) ** 2) * (0.85 + 0.15 * math.sin(2 * math.pi * t / 9.0))
         env *= 0.8
         n = self.tex.shape[0]
-        u1 = (wx / 1920.0 * 0.75 + t * 0.0045) * n
-        v1 = (wy / 1080.0 * 0.45 + t * 0.0016) * n
-        u2 = (wx / 1920.0 * 1.6 - t * 0.0065) * n
-        v2 = (wy / 1080.0 * 0.95 + t * 0.0035) * n
+        u1 = (wx / 1920.0 * 0.75 + t * 0.0080) * n
+        v1 = (wy / 1080.0 * 0.45 + t * 0.0030) * n
+        u2 = (wx / 1920.0 * 1.6 - t * 0.0110) * n
+        v2 = (wy / 1080.0 * 0.95 + t * 0.0060) * n
         c1 = ndimage.map_coordinates(self.tex, [v1.ravel(), u1.ravel()], order=1, mode="grid-wrap").reshape(gx.shape)
         c2 = ndimage.map_coordinates(self.tex, [v2.ravel(), u2.ravel()], order=1, mode="grid-wrap").reshape(gx.shape)
         cloud = smoothstep(0.12, 0.92, 0.7 * c1 + 0.3 * c2)
@@ -279,61 +280,65 @@ class Background:
                       float(vx[i]), float(vy[i]))
 
     def draw_axis(self, frame, ax, t):
-        """ax: dict(cam, drift, draw (0..1 from the centre out), alpha, pulse, glint)."""
+        """ax: dict(parts=[(cam, x_from, x_to, y)], drift, draw (0..1 from the centre out), alpha,
+        pulse, glint). Each part is the axis under one camera, clipped to [x_from, x_to) screen
+        design px, at screen y (the renderer keeps it clear of the rects)."""
         s = self.s
-        cam, drift = ax["cam"], ax["drift"]
+        drift = ax["drift"]
         a = ax["alpha"] * (0.85 + 0.15 * math.sin(2 * math.pi * t / 5.0)) * (1 + 0.8 * ax.get("pulse", 0.0))
         if a <= 2e-3 or ax["draw"] <= 1e-3:
             return
-        z = cam[0]
         dz, dx, dy = drift
-        ys = Y0 + AXIS_DY * (1 + AXIS_Y_PARALLAX * (z - 1)) * dz + dy
-        xs = lambda v: (((float(X(v)) - cam[1]) * z) * dz + 960.0 + dx)
-        xc = xs(0.5)
-        half = (xs(1.0) - xs(0.0)) / 2 * ax["draw"]
-        xa, xb = max(xc - half, -10.0), min(xc + half, W + 10.0)
         Hh, Ww = frame.shape[:2]
-        # hairline (1 design px, at least 0.7 raster px), with a slow glint travelling along it
-        y = ys * s
-        th = max(1.0 * s, 0.7)
-        i0, i1 = int(max(math.floor(xa * s), 0)), int(min(math.ceil(xb * s), Ww))
-        j0, j1 = int(math.floor(y - th / 2)), int(math.floor(y + th / 2)) + 1
-        if i1 > i0 and 0 <= j0 and j1 <= Hh:
-            px = np.arange(i0, i1, dtype=np.float32) + 0.5
-            g = ax.get("glint", None)
-            prof = np.ones_like(px)
-            if g is not None:
-                prof += 1.4 * np.exp(-0.5 * ((px / s - g) / 90.0) ** 2)
-            # soft ends
-            prof *= np.clip((px - xa * s) / (30 * s), 0, 1) * np.clip((xb * s - px) / (30 * s), 0, 1)
-            for j in range(j0, j1):
-                cov = min(j + 1, y + th / 2) - max(j, y - th / 2)
-                if cov <= 0:
-                    continue
-                reg = frame[j, i0:i1].astype(np.float32)
-                reg += (a * AXIS_ALPHA * cov * 255.0) * prof[:, None] * GOLD.astype(np.float32)
-                frame[j, i0:i1] = np.minimum(reg, 255.0).astype(np.uint8)
-        # ticks at 0, 0.1, ... 1 (longer at 0, 0.5, 1), appearing as the line reaches them
-        for k in range(11):
-            v = k / 10
-            xt = xs(v)
-            if xt < xa - 0.5 or xt > xb + 0.5:
+        for cam, c0, c1, ys in ax["parts"]:
+            z = cam[0]
+            xs = lambda v: (((float(X(v)) - cam[1]) * z) * dz + 960.0 + dx)
+            xc = xs(0.5)
+            half = (xs(1.0) - xs(0.0)) / 2 * ax["draw"]
+            ea, eb = xc - half, xc + half                    # true ends (soft)
+            xa, xb = max(ea, -10.0, c0), min(eb, W + 10.0, c1)
+            if xb <= xa:
                 continue
-            ln = (12.0 if k in (0, 5, 10) else 6.0) * min(z, 1.6) ** 0.5
-            tw = max(1.0 * s, 0.7)
-            x = xt * s
-            ii0, ii1 = int(math.floor(x - tw / 2)), int(math.floor(x + tw / 2)) + 1
-            jj0, jj1 = int(math.floor(y)), int(math.ceil(y + ln * s))
-            if ii0 < 0 or ii1 > Ww or jj0 < 0 or jj1 > Hh:
-                continue
-            for i in range(ii0, ii1):
-                cov = min(i + 1, x + tw / 2) - max(i, x - tw / 2)
-                if cov <= 0:
+            # hairline (1 design px, at least 0.7 raster px), with a slow glint travelling along it
+            y = ys * s
+            th = max(1.0 * s, 0.7)
+            i0, i1 = int(max(math.floor(xa * s), 0)), int(min(math.ceil(xb * s), Ww))
+            j0, j1 = int(math.floor(y - th / 2)), int(math.floor(y + th / 2)) + 1
+            if i1 > i0 and 0 <= j0 and j1 <= Hh:
+                px = np.arange(i0, i1, dtype=np.float32) + 0.5
+                g = ax.get("glint", None)
+                prof = np.ones_like(px)
+                if g is not None:
+                    prof += 1.4 * np.exp(-0.5 * ((px / s - g) / 90.0) ** 2)
+                prof *= np.clip((px - ea * s) / (30 * s), 0, 1) * np.clip((eb * s - px) / (30 * s), 0, 1)
+                for j in range(j0, j1):
+                    cov = min(j + 1, y + th / 2) - max(j, y - th / 2)
+                    if cov <= 0:
+                        continue
+                    reg = frame[j, i0:i1].astype(np.float32)
+                    reg += (a * AXIS_ALPHA * cov * 255.0) * prof[:, None] * GOLD.astype(np.float32)
+                    frame[j, i0:i1] = np.minimum(reg, 255.0).astype(np.uint8)
+            # ticks at 0, 0.1, ... 1 (longer at 0, 0.5, 1), appearing as the line reaches them
+            for k in range(11):
+                v = k / 10
+                xt = xs(v)
+                if xt < xa - 0.5 or xt > xb + 0.5 or not (c0 <= xt < c1):
                     continue
-                col = frame[jj0:jj1, i].astype(np.float32)
-                fall = np.linspace(1.0, 0.35, jj1 - jj0, dtype=np.float32)[:, None]
-                col += (a * TICK_ALPHA * cov * 255.0) * fall * GOLD.astype(np.float32)
-                frame[jj0:jj1, i] = np.minimum(col, 255.0).astype(np.uint8)
+                ln = (12.0 if k in (0, 5, 10) else 6.0) * min(z, 1.6) ** 0.5
+                tw = max(1.0 * s, 0.7)
+                x = xt * s
+                ii0, ii1 = int(math.floor(x - tw / 2)), int(math.floor(x + tw / 2)) + 1
+                jj0, jj1 = int(math.floor(y)), int(math.ceil(y + ln * s))
+                if ii0 < 0 or ii1 > Ww or jj0 < 0 or jj1 > Hh:
+                    continue
+                for i in range(ii0, ii1):
+                    cov = min(i + 1, x + tw / 2) - max(i, x - tw / 2)
+                    if cov <= 0:
+                        continue
+                    col = frame[jj0:jj1, i].astype(np.float32)
+                    fall = np.linspace(1.0, 0.35, jj1 - jj0, dtype=np.float32)[:, None]
+                    col += (a * TICK_ALPHA * cov * 255.0) * fall * GOLD.astype(np.float32)
+                    frame[jj0:jj1, i] = np.minimum(col, 255.0).astype(np.uint8)
 
 
 # ----------------------------------------------------------------------------- effects
@@ -359,6 +364,9 @@ def fx_ripple(frame, s, f):
     prof = 0.5 * np.exp(-0.5 * (d / sig) ** 2) + 0.5 * np.exp(-0.5 * (d / halo) ** 2)
     # fainter on the far (upper) side of the ellipse: reads as lying flat
     prof *= 0.55 + 0.45 * np.clip(0.5 + py / (2 * ry), 0, 1)
+    # ... and gone before the caption band (design y 800-900): it never crosses the text
+    yy = (py + cy) / s
+    prof *= np.clip((RIPPLE_FLOOR - yy) / 70.0, 0.0, 1.0) ** 2
     img = (amp * prof)[..., None] * np.asarray(f.get("rgb", GOLD), np.float32)
     add_region(frame, x0, y0, img)
 
